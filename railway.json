@@ -1,0 +1,7 @@
+{
+  "deploy": {
+    "startCommand": "python thongtinvacapnhat.py",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3
+  }
+}
