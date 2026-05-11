@@ -4,21 +4,17 @@ from dotenv import load_dotenv
 import aiohttp
 import asyncio
 import os
+import json
 import logging
-import random
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, List
 
 # =========================
-# LOGGING SETUP
+# LOGGING
 # =========================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
@@ -28,57 +24,125 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+CHANNEL_ID    = int(os.getenv("CHANNEL_ID", "0"))
 
-# API compatible (fallback)
-API_BASE = os.getenv("API_BASE")
-API_KEY = os.getenv("API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME")
-
-# Tavily + Groq (chính)
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+
+# Fallback API compatible (OpenAI-style)
+API_BASE   = os.getenv("API_BASE", "")
+API_KEY    = os.getenv("API_KEY", "")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
 # =========================
 # CONFIGURATION
 # =========================
 class Config:
-    SEARCH_INTERVAL_HOURS = 6           # *** ĐÃ ĐỔI THÀNH 6 GIỜ ***
-    MAX_RETRIES = 3
-    RETRY_DELAY_SECONDS = 5
-    API_TIMEOUT_SECONDS = 90
-    MAX_DISCORD_MESSAGE_LENGTH = 3900
-    TEMPERATURE = 0.3
-    TIMEZONE_OFFSET = 7
+    SEARCH_INTERVAL_HOURS   = 6
+    MAX_RETRIES             = 3
+    RETRY_DELAY_SECONDS     = 2        # exponential backoff base
+    API_TIMEOUT_SECONDS     = 60
+    MAX_PLAIN_TEXT_LENGTH   = 1900     # Discord plain text safe limit
+    TIMEZONE_OFFSET         = 7        # UTC+7
+    SLOTS                   = [0, 6, 12, 18]
+    SEMAPHORE_LIMIT         = 5        # max concurrent API requests
+    STATE_FILE              = "bot_state.json"  # persist last_sent_slot
 
-    # Các mốc giờ cố định (0, 6, 12, 18) theo giờ VN
-    SLOTS = [0, 6, 12, 18]
 
-    # Danh sách các chủ đề tìm kiếm đa dạng (sẽ chạy song song)
-    SEARCH_TOPICS = [
+# =========================
+# TOPIC GROUPS
+# =========================
+TOPIC_GROUPS: dict[str, list[str]] = {
+    "🤖 AI & Công Nghệ": [
         "AI news worldwide last 6 hours",
-        "AI news Vietnam last 6 hours",
-        "OpenAI announcement today",
-        "Google AI news today",
-        "Meta AI news today",
-        "Microsoft AI news today",
-        "NVIDIA AI news today",
-        "artificial intelligence breakthrough",
-        "Việt Nam AI trí tuệ nhân tạo mới nhất",
-        "AI robotics hardware release"
-    ]
+        "ChatGPT new updates today",
+        "large language model breakthrough",
+        "smartphone launch news",
+        "cybersecurity incident news",
+        "tech startup funding news",
+        "electric vehicle news",
+        "space NASA SpaceX news",
+        "Việt Nam AI công nghệ mới",
+        "Apple Google Microsoft news",
+    ],
+    "🇻🇳 Tin Việt Nam": [
+        "Việt Nam tai nạn giao thông mới nhất",
+        "Việt Nam thiên tai bão lũ hôm nay",
+        "Việt Nam pháp luật hình sự",
+        "Việt Nam chính trị nhà nước",
+        "Việt Nam kinh tế trong nước",
+        "Việt Nam giáo dục tin mới",
+        "Việt Nam môi trường ô nhiễm",
+        "tin địa phương Hà Nội TP HCM",
+    ],
+    "🎬 Giải Trí & Phim": [
+        "phim chiếu rạp mới 2026",
+        "Netflix new releases today",
+        "phim Hàn K-Drama mới",
+        "Hollywood movie news",
+        "tin sao celebrity Việt",
+        "Kpop news",
+    ],
+    "⛩️ Anime & Manga": [
+        "anime season 2026 news",
+        "manga hot chapter release",
+        "One Piece latest news",
+        "light novel anime adaptation",
+        "Nhật Bản anime tin tức",
+    ],
+    "⚽ Thể Thao": [
+        "bóng đá Việt Nam tin mới nhất",
+        "Premier League news",
+        "Champions League results",
+        "Esports LMHT VCS tin",
+        "tin chuyển nhượng bóng đá",
+        "Olympic thể thao tin",
+    ],
+    "📈 Crypto & Tài Chính": [
+        "Bitcoin price news today",
+        "Altcoin DeFi news",
+        "VN-Index chứng khoán hôm nay",
+        "vàng tỷ giá ngoại tệ",
+        "kinh tế thế giới tin mới",
+    ],
+    "🏥 Sức Khỏe": [
+        "dịch bệnh cúm virus mới",
+        "dinh dưỡng sức khỏe mới",
+        "thuốc điều trị nghiên cứu mới",
+        "tin y tế Việt Nam",
+        "thể dục fitness trend",
+    ],
+}
+
+GROUP_COLORS: dict[str, int] = {
+    "🤖 AI & Công Nghệ":    0x00CFFF,
+    "🇻🇳 Tin Việt Nam":      0xFF4444,
+    "🎬 Giải Trí & Phim":   0xFF9900,
+    "⛩️ Anime & Manga":     0xFF69B4,
+    "⚽ Thể Thao":           0x44FF88,
+    "📈 Crypto & Tài Chính": 0xF7D000,
+    "🏥 Sức Khỏe":           0x88FFCC,
+}
 
 # =========================
-# DISCORD BOT
+# PERSISTENT STATE
 # =========================
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+def load_state() -> dict:
+    try:
+        with open(Config.STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"last_sent_slot": -1}
 
-last_sent_slot = -1
+def save_state(state: dict):
+    try:
+        with open(Config.STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logger.error(f"Lỗi lưu state: {e}")
 
 # =========================
-# UTILS: THỜI GIAN VN
+# TIME UTILS (VN)
 # =========================
 def get_vn_now() -> datetime:
     return datetime.utcnow() + timedelta(hours=Config.TIMEZONE_OFFSET)
@@ -88,41 +152,415 @@ def format_time_range(start: datetime, end: datetime) -> str:
 
 def get_current_slot() -> int:
     hour = get_vn_now().hour
-    # Tìm mốc gần nhất nhưng không vượt quá giờ hiện tại
     for slot in sorted(Config.SLOTS, reverse=True):
         if hour >= slot:
             return slot
     return Config.SLOTS[-1]
 
-def get_slot_range(slot: int):
-    """Trả về khoảng thời gian 6 giờ tương ứng với mốc (slot)"""
+def get_slot_range(slot: int) -> tuple[datetime, datetime]:
     now = get_vn_now()
     end = now.replace(hour=slot, minute=0, second=0, microsecond=0)
-    # Nếu mốc là 0 (nửa đêm), start là 18h hôm qua
-    if slot == 0:
-        start = end - timedelta(hours=6)
-    else:
-        start = end - timedelta(hours=6)
-    # Xử lý trường hợp gần mốc
-    if start > end:
-        start = end - timedelta(hours=6)
+    start = end - timedelta(hours=6)
+    if start.day != end.day and slot == 0:
+        start = (end - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
     return start, end
 
-def get_next_slot_time():
+def get_next_slot_time() -> datetime:
     now = get_vn_now()
     current_slot = get_current_slot()
     for slot in Config.SLOTS:
         if slot > current_slot:
             return now.replace(hour=slot, minute=0, second=0, microsecond=0)
-    # Nếu đã qua mốc cuối (18h), chuyển sang mốc 0h ngày mai
-    next_day = now + timedelta(days=1)
-    return next_day.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
 async def wait_until_next_slot():
     next_time = get_next_slot_time()
-    now = get_vn_now()
-    wait_sec = (next_time - now).total_seconds()
-    if wait_sec < 0:
+    wait_sec = max((next_time - get_vn_now()).total_seconds(), 0)
+    logger.info(f"⏳ Chờ {wait_sec:.0f}s đến mốc {next_time.strftime('%H:%M')}")
+    await asyncio.sleep(wait_sec)
+
+# =========================
+# RETRY HELPER
+# =========================
+async def with_retry(coro_fn, retries: int = Config.MAX_RETRIES, delay: float = Config.RETRY_DELAY_SECONDS):
+    """Chạy coroutine với exponential backoff."""
+    for attempt in range(retries):
+        try:
+            return await coro_fn()
+        except Exception as e:
+            if attempt == retries - 1:
+                logger.error(f"Hết retry sau {retries} lần: {e}")
+                return None
+            wait = delay * (2 ** attempt)
+            logger.warning(f"Retry {attempt+1}/{retries} sau {wait:.1f}s — lỗi: {e}")
+            await asyncio.sleep(wait)
+    return None
+
+# =========================
+# TAVILY SEARCH
+# =========================
+async def search_tavily(session: aiohttp.ClientSession, query: str, start: datetime, end: datetime):
+    if not TAVILY_API_KEY:
+        return None
+
+    async def _call():
+        payload = {
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "search_depth": "advanced",
+            "max_results": 5,
+            "include_answer": True,
+            "days": Config.SEARCH_INTERVAL_HOURS // 24 or 1,  # Tavily dùng "days", không phải timestamp
+        }
+        async with session.post(
+            "https://api.tavily.com/search",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+    return await with_retry(_call)
+
+# =========================
+# GROQ SUMMARIZE
+# =========================
+async def summarize_groq(
+    session: aiohttp.ClientSession,
+    search_data: dict,
+    start: datetime,
+    end: datetime,
+    topic: str,
+) -> str:
+    if not GROQ_API_KEY or not search_data:
+        return ""
+
+    time_range_str = format_time_range(start, end)
+    system_prompt = (
+        f'Bạn là chuyên gia tổng hợp tin tức (tiếng Việt). '
+        f'Chủ đề: "{topic}" | Khung giờ: {time_range_str}. '
+        f'Chọn 2–3 tin nổi bật nhất. Mỗi tin: tiêu đề in đậm, tóm tắt 2 câu, link. '
+        f'Dùng markdown và emoji. Nếu không có tin mới, trả về chuỗi rỗng.'
+    )
+    user_content = f"Tổng quan: {search_data.get('answer', '')}\n"
+    for idx, res in enumerate(search_data.get("results", [])[:5], 1):
+        user_content += (
+            f"\n{idx}. {res['title']}\n"
+            f"   {res['content'][:400]}\n"
+            f"   🔗 {res['url']}\n"
+        )
+
+    async def _call():
+        async with session.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0.4,
+                "max_tokens": 800,
+            },
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data["choices"][0]["message"]["content"]
+
+    result = await with_retry(_call)
+    return result or ""
+
+# =========================
+# FALLBACK API COMPATIBLE
+# =========================
+async def summarize_compatible(
+    session: aiohttp.ClientSession,
+    topic: str,
+    start: datetime,
+    end: datetime,
+) -> str:
+    if not API_BASE or not API_KEY:
+        return ""
+
+    time_range = format_time_range(start, end)
+    prompt = (
+        f"Tìm tin tức về '{topic}' trong khung giờ {time_range} (giờ VN). "
+        f"Trả lời tiếng Việt, mỗi tin có tiêu đề, tóm tắt 2 câu, link. "
+        f"Nếu không có tin, trả lời 'KHÔNG CÓ TIN'."
+    )
+
+    async def _call():
+        async with session.post(
+            f"{API_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={
+                "model": MODEL_NAME,
+                "messages": [
+                    {"role": "system", "content": "Bạn là trợ lý tổng hợp tin tức."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 800,
+            },
+            timeout=aiohttp.ClientTimeout(total=Config.API_TIMEOUT_SECONDS),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data["choices"][0]["message"]["content"]
+
+    result = await with_retry(_call)
+    if result and "KHÔNG CÓ TIN" not in result and len(result) > 50:
+        return result
+    return ""
+
+# =========================
+# SEARCH ONE TOPIC (TAVILY+GROQ hoặc FALLBACK)
+# =========================
+_semaphore = asyncio.Semaphore(Config.SEMAPHORE_LIMIT)
+
+async def search_one_topic(
+    session: aiohttp.ClientSession,
+    topic: str,
+    start: datetime,
+    end: datetime,
+) -> str:
+    async with _semaphore:
+        if TAVILY_API_KEY and GROQ_API_KEY:
+            search_data = await search_tavily(session, topic, start, end)
+            if search_data and search_data.get("results"):
+                return await summarize_groq(session, search_data, start, end, topic)
+        if API_BASE and API_KEY:
+            return await summarize_compatible(session, topic, start, end)
+        return ""
+
+# =========================
+# BUILD DIGEST THEO NHÓM
+# =========================
+async def build_digest_grouped(start: datetime, end: datetime) -> dict[str, str]:
+    """
+    Trả về dict {group_name: content_text}.
+    Chạy parallel toàn bộ topics, dedup kết quả trùng.
+    """
+    async with aiohttp.ClientSession() as session:
+        # Flatten: (group_name, topic) để gather 1 lần duy nhất
+        flat: list[tuple[str, str]] = [
+            (group, topic)
+            for group, topics in TOPIC_GROUPS.items()
+            for topic in topics
+        ]
+        tasks = [search_one_topic(session, topic, start, end) for _, topic in flat]
+        results = await asyncio.gather(*tasks)
+
+    # Gom về nhóm + dedup
+    group_contents: dict[str, list[str]] = {g: [] for g in TOPIC_GROUPS}
+    seen_keys: set[str] = set()
+
+    for (group, _), content in zip(flat, results):
+        if not content or len(content) < 50:
+            continue
+        dedup_key = content[:60].strip().lower()
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        group_contents[group].append(content)
+
+    return {
+        group: "\n\n".join(articles)
+        for group, articles in group_contents.items()
+        if articles
+    }
+
+# =========================
+# SPLIT CONTENT
+# =========================
+def split_content(text: str, max_len: int = Config.MAX_PLAIN_TEXT_LENGTH) -> list[str]:
+    """
+    Split tại ranh giới bài (\\n\\n), không bao giờ cắt giữa bài.
+    Hard-split chỉ khi 1 bài đơn lẻ vượt max_len.
+    """
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for article in text.split("\n\n"):
+        candidate = (current + "\n\n" + article).strip() if current else article
+        if len(candidate) <= max_len:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            if len(article) > max_len:
+                for i in range(0, len(article), max_len):
+                    chunks.append(article[i : i + max_len])
+                current = ""
+            else:
+                current = article
+    if current:
+        chunks.append(current)
+    return chunks
+
+# =========================
+# GỬI DISCORD THEO NHÓM
+# =========================
+async def send_grouped_digest(channel: discord.TextChannel, start: datetime, end: datetime):
+    group_data = await build_digest_grouped(start, end)
+    time_str    = format_time_range(start, end)
+    total_topics = sum(len(v) for v in TOPIC_GROUPS.values())
+    active_groups = len(group_data)
+    total_articles = sum(c.count("\n\n") + 1 for c in group_data.values())
+
+    # ── 1. Header embed tổng hợp ──────────────────────────────────
+    header = discord.Embed(
+        title="📰 TỔNG HỢP TIN TỨC",
+        description=(
+            f"🕐 **{time_str}** (giờ VN)\n"
+            f"📂 **{active_groups}/{len(TOPIC_GROUPS)} nhóm**  •  "
+            f"📄 **~{total_articles} bài**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
+        color=0x00FFCC,
+        timestamp=datetime.utcnow(),
+    )
+    header.set_footer(text=f"🤖 Cập nhật mỗi 6 giờ | {total_topics} chủ đề | Tavily + Groq")
+    await channel.send(embed=header)
+    await asyncio.sleep(0.5)
+
+    # ── 2. Từng nhóm: embed tiêu đề + plain text nội dung ─────────
+    for group_name, content in group_data.items():
+        color = GROUP_COLORS.get(group_name, 0xAAAAAA)
+
+        # Embed nhỏ làm header nhóm
+        group_embed = discord.Embed(title=group_name, color=color)
+        await channel.send(embed=group_embed)
+
+        # Plain text, split an toàn
+        for chunk in split_content(content):
+            await channel.send(chunk)
+            await asyncio.sleep(0.3)
+
+        await asyncio.sleep(0.5)
+
+    logger.info(f"✅ Đã gửi {active_groups} nhóm / {total_articles} bài cho {time_str}")
+
+# =========================
+# DISCORD BOT
+# =========================
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# =========================
+# TASK TỰ ĐỘNG
+# =========================
+async def auto_news_scheduler():
+    await bot.wait_until_ready()
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        logger.error(f"Không tìm thấy channel {CHANNEL_ID}")
+        return
+
+    state = load_state()
+
+    while not bot.is_closed():
+        current_slot = get_current_slot()
+        if current_slot != state["last_sent_slot"]:
+            start, end = get_slot_range(current_slot)
+            logger.info(f"📢 Tự động gửi tin mốc {current_slot}:00")
+            try:
+                await send_grouped_digest(channel, start, end)
+                state["last_sent_slot"] = current_slot
+                save_state(state)
+            except Exception as e:
+                logger.error(f"Lỗi gửi digest: {e}")
+        await wait_until_next_slot()
+
+# =========================
+# COMMANDS
+# =========================
+@bot.command(name="news", aliases=["tin"])
+async def cmd_news(ctx: commands.Context):
+    if ctx.channel.id != CHANNEL_ID:
+        await ctx.send(f"❌ Chỉ hoạt động trong kênh <#{CHANNEL_ID}>")
+        return
+    async with ctx.typing():
+        msg = await ctx.send("🔍 Đang tổng hợp tin tức 6 giờ qua…")
+        now   = get_vn_now()
+        start = now - timedelta(hours=Config.SEARCH_INTERVAL_HOURS)
+        await msg.delete()
+        await send_grouped_digest(ctx.channel, start, now)
+
+
+@bot.command(name="ping")
+async def cmd_ping(ctx: commands.Context):
+    await ctx.send(f"🏓 Pong! `{round(bot.latency * 1000)}ms`")
+
+
+@bot.command(name="status")
+async def cmd_status(ctx: commands.Context):
+    state   = load_state()
+    vn_now  = get_vn_now()
+    next_t  = get_next_slot_time()
+    wait_m  = int((next_t - vn_now).total_seconds() // 60)
+
+    embed = discord.Embed(title="🤖 Bot Status", color=0x00FF88, timestamp=datetime.utcnow())
+    embed.add_field(name="Giờ VN",          value=vn_now.strftime("%H:%M:%S %d/%m/%Y"), inline=False)
+    embed.add_field(name="Mốc hiện tại",    value=f"{get_current_slot()}:00",           inline=True)
+    embed.add_field(name="Mốc tiếp theo",   value=f"{next_t.strftime('%H:%M')} (~{wait_m}p)", inline=True)
+    embed.add_field(name="Đã gửi mốc",      value=str(state["last_sent_slot"]),         inline=True)
+    embed.add_field(name="Nhóm / Chủ đề",   value=f"{len(TOPIC_GROUPS)} / {sum(len(v) for v in TOPIC_GROUPS.values())}", inline=True)
+    embed.add_field(name="Tavily + Groq",   value="✅" if (TAVILY_API_KEY and GROQ_API_KEY) else "❌", inline=True)
+    embed.add_field(name="Fallback API",    value="✅" if (API_BASE and API_KEY) else "❌",             inline=True)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="forcenews", aliases=["force"])
+async def cmd_force(ctx: commands.Context):
+    """Gửi ngay không cần chờ mốc — dùng để test."""
+    if ctx.channel.id != CHANNEL_ID:
+        await ctx.send(f"❌ Chỉ hoạt động trong kênh <#{CHANNEL_ID}>")
+        return
+    async with ctx.typing():
+        msg   = await ctx.send("⚡ Force gửi tin tức…")
+        now   = get_vn_now()
+        start = now - timedelta(hours=Config.SEARCH_INTERVAL_HOURS)
+        await msg.delete()
+        await send_grouped_digest(ctx.channel, start, now)
+        # Cập nhật state để tránh gửi trùng ở mốc tiếp theo
+        state = load_state()
+        state["last_sent_slot"] = get_current_slot()
+        save_state(state)
+
+
+# =========================
+# ON READY
+# =========================
+@bot.event
+async def on_ready():
+    total_topics = sum(len(v) for v in TOPIC_GROUPS.values())
+    logger.info(f"✅ Bot online: {bot.user} | {len(TOPIC_GROUPS)} nhóm | {total_topics} chủ đề")
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name=f"{total_topics} chủ đề | mỗi 6h",
+        )
+    )
+    bot.loop.create_task(auto_news_scheduler())
+
+
+# =========================
+# ENTRY POINT
+# =========================
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        logger.error("❌ Thiếu DISCORD_TOKEN trong .env")
+        raise SystemExit(1)
+    if not CHANNEL_ID:
+        logger.error("❌ Thiếu CHANNEL_ID trong .env")
+        raise SystemExit(1)
+    bot.run(DISCORD_TOKEN)
         wait_sec = 0
     logger.info(f"Chờ {wait_sec:.0f}s đến mốc {next_time.strftime('%H:%M')}")
     await asyncio.sleep(wait_sec)
