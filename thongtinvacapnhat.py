@@ -32,7 +32,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 # OpenAI Compatible API
 API_BASE = os.getenv("API_BASE")
 API_KEY = os.getenv("API_KEY")
-MODEL_NAME = "MODEL_NAME"  # Model mới, nhanh hơn
+MODEL_NAME = os.getenv("MODEL_NAME")
 
 # Optional: Tavily fallback (nếu model search lỗi)
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
