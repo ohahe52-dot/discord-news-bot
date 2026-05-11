@@ -1,12 +1,17 @@
 FROM python:3.11-slim
 
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
+
+# Cài đặt dependencies hệ thống
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Chỉ copy file code, KHÔNG copy .env
 COPY thongtinvacapnhat.py .
 
-# Lệnh chạy bot
 CMD ["python", "thongtinvacapnhat.py"]
