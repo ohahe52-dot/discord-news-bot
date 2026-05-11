@@ -43,17 +43,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 # CONFIGURATION
 # =========================
 class Config:
-    SEARCH_INTERVAL_HOURS = 3          # mốc 3 giờ
+    SEARCH_INTERVAL_HOURS = 3
     MAX_RETRIES = 3
     RETRY_DELAY_SECONDS = 5
     API_TIMEOUT_SECONDS = 60
     MAX_DISCORD_MESSAGE_LENGTH = 3900
     TEMPERATURE = 0.3
-
-    # Múi giờ Việt Nam (UTC+7)
     TIMEZONE_OFFSET = 7
-
-    # Các mốc giờ cố định (0,3,6,9,12,15,18,21) theo giờ VN
     SLOTS = [0, 3, 6, 9, 12, 15, 18, 21]
 
 # =========================
@@ -63,48 +59,36 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Lưu mốc đã gửi (trong RAM, có thể mất khi restart nhưng không ảnh hưởng nhiều)
 last_sent_slot = -1
 
 # =========================
 # UTILS: THỜI GIAN VN
 # =========================
 def get_vn_now() -> datetime:
-    """Trả về datetime hiện tại theo múi giờ UTC+7 (naive)"""
     return datetime.utcnow() + timedelta(hours=Config.TIMEZONE_OFFSET)
 
 def format_time_range(start: datetime, end: datetime) -> str:
-    """Format thời gian dùng cho prompt: 'HH:MM DD/MM/YYYY'"""
     return f"{start.strftime('%H:%M %d/%m/%Y')} → {end.strftime('%H:%M %d/%m/%Y')}"
 
 def get_current_slot() -> int:
-    """Trả về mốc giờ (0-21) hiện tại theo giờ VN"""
-    now = get_vn_now()
-    hour = now.hour
+    hour = get_vn_now().hour
     for slot in sorted(Config.SLOTS, reverse=True):
         if hour >= slot:
             return slot
     return Config.SLOTS[-1]
 
-def get_slot_range(slot: int) -> tuple:
-    """
-    Với một mốc giờ (0,3,...,21), trả về (start_time, end_time) naive (VN timezone)
-    Ví dụ slot=6 -> start=03:00, end=06:00 cùng ngày.
-    slot=0 -> start=21:00 hôm qua, end=00:00 hôm nay.
-    """
+def get_slot_range(slot: int):
     now = get_vn_now()
     end = now.replace(hour=slot, minute=0, second=0, microsecond=0)
     if slot == 0:
-        start = end - timedelta(days=1, hours=3)  # 21:00 hôm qua
+        start = end - timedelta(days=1, hours=3)
     else:
         start = end - timedelta(hours=3)
-    # Đảm bảo start không lớn hơn end (trường hợp gần mốc)
     if start > end:
         start = end - timedelta(hours=3)
     return start, end
 
-def get_next_slot_time() -> datetime:
-    """Thời gian của mốc tiếp theo (VN)"""
+def get_next_slot_time():
     now = get_vn_now()
     current_slot = get_current_slot()
     for slot in Config.SLOTS:
@@ -117,7 +101,6 @@ def get_next_slot_time() -> datetime:
     return now.replace(hour=next_slot, minute=0, second=0, microsecond=0)
 
 async def wait_until_next_slot():
-    """Sleep đến mốc tiếp theo"""
     next_time = get_next_slot_time()
     now = get_vn_now()
     wait_sec = (next_time - now).total_seconds()
@@ -127,7 +110,7 @@ async def wait_until_next_slot():
     await asyncio.sleep(wait_sec)
 
 # =========================
-# API COMPATIBLE (FALLBACK) – có truyền thời gian
+# API COMPATIBLE (FALLBACK)
 # =========================
 async def make_api_call(session: aiohttp.ClientSession, messages: list, retry_count: int = 0) -> Optional[Dict[str, Any]]:
     if not API_KEY or not API_BASE:
@@ -163,11 +146,21 @@ async def get_news_compatible(start: datetime, end: datetime) -> str:
     async with aiohttp.ClientSession() as session:
         time_range_str = format_time_range(start, end)
         system_prompt = f"""Bạn là AI săn tin công nghệ, có khả năng tìm kiếm internet.
-Yêu cầu: Tìm các bài báo/tin tức công nghệ được công bố trong khung giờ CHÍNH XÁC sau:
+Yêu cầu: Phản hồi bằng tiếng việt, tìm các bài báo/tin tức công nghệ được công bố trong khung giờ CHÍNH XÁC sau:
 Khoảng thời gian: {time_range_str} (giờ Việt Nam, UTC+7)
-Chỉ lấy tin có thời gian đăng nằm trong khoảng này. Ưu tiên tin nóng về AI, phần cứng, robot, bảo mật, không gian.
-Mỗi tin cần có: tiêu đề, tóm tắt 2-3 câu, link nguồn.
-Trình bày markdown với emoji, rõ ràng."""
+
+**QUAN TRỌNG - NGUỒN TIN ĐA DẠNG:**
+- BẮT BUỘC lấy tin từ NHIỀU nguồn khác nhau, không chỉ một vài trang.
+- Ưu tiên các trang báo công nghệ uy tín toàn cầu: TechCrunch, The Verge, Ars Technica, Wired, ZDNet, CNET, Reuters, Bloomberg, Associated Press, The Next Web, PCMag, Tom's Hardware, AnandTech, IEEE Spectrum, MIT Technology Review.
+- Có thể lấy từ blog chính thức của công ty (OpenAI, Google, Microsoft, Nvidia) hoặc các nền tảng khoa học (arXiv, Nature) nếu có tin mới.
+- **HẠN CHẾ TỐI ĐA** lấy từ các bản tin tổng hợp dạng newsletter (ví dụ: The Rundown AI, TLDR, Import AI) – chỉ dùng khi không còn nguồn nào khác.
+
+**NỘI DUNG ƯU TIÊN:**
+AI, phần cứng (GPU/CPU), robot, bảo mật, không gian, năng lượng, viễn thông.
+
+**YÊU CẦU ĐẦU RA:**
+Mỗi tin cần có: tiêu đề, tóm tắt 2-3 câu, link nguồn gốc (không phải link newsletter tổng hợp). Trình bày markdown với emoji, rõ ràng.
+"""
         user_prompt = f"Hãy tìm tin công nghệ mới nhất trong khoảng {time_range_str}. Đảm bảo mỗi tin đều có link thật."
         messages = [
             {"role": "system", "content": system_prompt},
@@ -180,15 +173,12 @@ Trình bày markdown với emoji, rõ ràng."""
         return ""
 
 # =========================
-# TAVILY + GROQ (ƯU TIÊN) – truyền khoảng thời gian cụ thể
+# TAVILY + GROQ (ƯU TIÊN)
 # =========================
 async def search_tavily(session: aiohttp.ClientSession, query: str, start: datetime, end: datetime) -> Optional[Dict[str, Any]]:
     if not TAVILY_API_KEY:
         return None
     try:
-        # Chuyển start thành timestamp (giây)
-        # Lưu ý: start, end là naive VN time, nhưng Tavily hiểu UTC.
-        # Ta trừ đi 7h để đưa về UTC (vì start, end đang là VN)
         start_utc = start - timedelta(hours=Config.TIMEZONE_OFFSET)
         after_ts = int(start_utc.timestamp())
         payload = {
@@ -236,23 +226,18 @@ async def summarize_groq(session: aiohttp.ClientSession, search_data: Dict[str, 
         return ""
 
 async def get_news_tavily_groq(start: datetime, end: datetime) -> str:
-    """Lấy tin bằng Tavily+Groq trong khoảng thời gian start→end"""
     async with aiohttp.ClientSession() as session:
         topics = ["technology breakthrough", "AI news", "GPU CPU release", "cybersecurity", "space tech"]
-        search_result = None
         for topic in topics:
             res = await search_tavily(session, topic, start, end)
             if res and res.get('results'):
-                search_result = res
-                break
+                summary = await summarize_groq(session, res, start, end)
+                if summary:
+                    return summary
             await asyncio.sleep(1)
-        if not search_result:
-            return ""
-        summary = await summarize_groq(session, search_result, start, end)
-        return summary if summary else ""
+        return ""
 
 async def get_news_tavily_only(start: datetime, end: datetime) -> str:
-    """Fallback chỉ Tavily (không AI)"""
     if not TAVILY_API_KEY:
         return "⚠️ Bot đang bảo trì. Vui lòng thử lại sau 30 phút."
     async with aiohttp.ClientSession() as session:
@@ -270,10 +255,9 @@ async def get_news_tavily_only(start: datetime, end: datetime) -> str:
         return f"⚠️ Không tìm thấy tin tức trong khoảng {format_time_range(start, end)}."
 
 # =========================
-# MAIN DIGEST – NHẬN start, end
+# MAIN DIGEST
 # =========================
 async def build_digest(start: datetime, end: datetime) -> str:
-    """Tổng hợp tin trong khoảng thời gian start→end, ưu tiên Tavily+Groq"""
     logger.info(f"Build digest from {start} to {end}")
     if TAVILY_API_KEY and GROQ_API_KEY:
         try:
@@ -291,22 +275,20 @@ async def build_digest(start: datetime, end: datetime) -> str:
     return f"⚠️ Bot đang bảo trì. Không thể lấy tin cho khung {format_time_range(start, end)}."
 
 # =========================
-# TASK TỰ ĐỘNG THEO MỐC 3 GIỜ CỐ ĐỊNH
+# TASK TỰ ĐỘNG THEO MỐC
 # =========================
 async def auto_news_scheduler():
-    """Chạy nền: đợi đến từng mốc giờ, gửi tin cho khung 3 giờ vừa qua"""
     global last_sent_slot
     await bot.wait_until_ready()
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         logger.error(f"Không tìm thấy channel {CHANNEL_ID}")
         return
-
     while not bot.is_closed():
         current_slot = get_current_slot()
         if current_slot != last_sent_slot:
             start, end = get_slot_range(current_slot)
-            logger.info(f"Tự động gửi tin cho mốc {current_slot}:00 → khoảng {start.strftime('%H:%M %d/%m')} - {end.strftime('%H:%M %d/%m')}")
+            logger.info(f"Tự động gửi mốc {current_slot}:00 → {start.strftime('%H:%M %d/%m')} - {end.strftime('%H:%M %d/%m')}")
             digest = await build_digest(start, end)
             if len(digest) > Config.MAX_DISCORD_MESSAGE_LENGTH:
                 digest = digest[:Config.MAX_DISCORD_MESSAGE_LENGTH - 100] + "\n\n... (cắt)"
@@ -330,7 +312,6 @@ async def auto_news_scheduler():
 # =========================
 @bot.command(name="news", aliases=["tin"])
 async def get_news(ctx):
-    """Lệnh thủ công: tìm tin trong 3 giờ qua (từ lúc gọi lệnh)"""
     if ctx.channel.id != CHANNEL_ID:
         await ctx.send(f"❌ Chỉ hoạt động trong kênh <#{CHANNEL_ID}>")
         return
