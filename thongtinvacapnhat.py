@@ -1,312 +1,1605 @@
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+
 import aiohttp
 import asyncio
 import os
 import json
 import logging
-from datetime import datetime, timedelta
+import time
+import hashlib
 
-# =========================
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List, Tuple
+
+# =========================================================
 # LOGGING
-# =========================
+# =========================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()],
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log", encoding="utf-8")
+    ]
 )
+
 logger = logging.getLogger(__name__)
 
-# =========================
+# =========================================================
 # LOAD ENV
-# =========================
+# =========================================================
+
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID    = int(os.getenv("CHANNEL_ID", "0"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+API_BASE = os.getenv("API_BASE", "")
+API_KEY = os.getenv("API_KEY", "")
+MODEL_NAME = os.getenv("MODEL_NAME", "")
 
-# Fallback API compatible (OpenAI-style)
-API_BASE   = os.getenv("API_BASE", "")
-API_KEY    = os.getenv("API_KEY", "")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+# =========================================================
+# CONFIG
+# =========================================================
 
-# =========================
-# CONFIGURATION
-# =========================
 class Config:
-    SEARCH_INTERVAL_HOURS   = 6
-    MAX_RETRIES             = 3
-    RETRY_DELAY_SECONDS     = 2        # exponential backoff base
-    API_TIMEOUT_SECONDS     = 60
-    MAX_PLAIN_TEXT_LENGTH   = 1900     # Discord plain text safe limit
-    TIMEZONE_OFFSET         = 7        # UTC+7
-    SLOTS                   = [0, 6, 12, 18]
-    SEMAPHORE_LIMIT         = 5        # max concurrent API requests
-    STATE_FILE              = "bot_state.json"  # persist last_sent_slot
 
+    # search
+    SEARCH_INTERVAL_HOURS = 6
 
-# =========================
+    # retry
+    MAX_RETRIES = 5
+    RETRY_DELAY = 2
+
+    # timeout
+    REQUEST_TIMEOUT = 180
+
+    # discord
+    MAX_DISCORD_LENGTH = 1900
+    DISCORD_DELAY = 0.5
+
+    # timezone
+    TIMEZONE_OFFSET = 7
+
+    # parallel requests
+    MAX_PARALLEL_REQUESTS = 20
+
+    # aiohttp connector
+    TCP_LIMIT = 100
+    DNS_CACHE = 300
+
+    # scheduler
+    SLOTS = [0, 6, 12, 18]
+
+    # cache
+    CACHE_EXPIRE = 3600
+
+    # token control
+    MAX_TOKENS = 2000
+
+    # state
+    STATE_FILE = "bot_state.json"
+
+# =========================================================
 # TOPIC GROUPS
-# =========================
-TOPIC_GROUPS: dict[str, list[str]] = {
+# =========================================================
+
+TOPIC_GROUPS = {
+
     "🤖 AI & Công Nghệ": [
-        "AI news worldwide last 6 hours",
-        "ChatGPT new updates today",
+
+        "AI news worldwide",
+        "OpenAI news",
+        "ChatGPT updates",
+        "Claude AI",
+        "Gemini AI",
+        "DeepSeek AI",
         "large language model breakthrough",
-        "smartphone launch news",
-        "cybersecurity incident news",
-        "tech startup funding news",
-        "electric vehicle news",
-        "space NASA SpaceX news",
-        "Việt Nam AI công nghệ mới",
-        "Apple Google Microsoft news",
+        "AI agents",
+        "AI automation",
+        "machine learning research",
+        "robotics AI",
+        "cybersecurity AI",
+        "NVIDIA AI",
+        "AMD AI",
+        "Intel AI",
+
+        "Apple news",
+        "Google news",
+        "Microsoft news",
+        "Samsung technology",
+        "Linux news",
+        "Windows update",
+        "cloud computing",
+        "datacenter technology",
+        "quantum computing",
+
+        "SpaceX news",
+        "NASA news",
+        "science breakthrough",
+
+        "Việt Nam AI",
+        "Việt Nam công nghệ",
+        "Việt Nam startup công nghệ",
     ],
-    "🇻🇳 Tin Việt Nam": [
-        "Việt Nam tai nạn giao thông mới nhất",
-        "Việt Nam thiên tai bão lũ hôm nay",
-        "Việt Nam pháp luật hình sự",
-        "Việt Nam chính trị nhà nước",
-        "Việt Nam kinh tế trong nước",
-        "Việt Nam giáo dục tin mới",
-        "Việt Nam môi trường ô nhiễm",
-        "tin địa phương Hà Nội TP HCM",
+
+    "🇻🇳 Việt Nam": [
+
+        "Việt Nam kinh tế",
+        "Việt Nam giáo dục",
+        "Việt Nam pháp luật",
+        "Việt Nam an ninh mạng",
+        "Việt Nam giao thông",
+        "Việt Nam môi trường",
+        "Việt Nam y tế",
+
+        "Hà Nội tin mới",
+        "TP HCM tin mới",
     ],
-    "🎬 Giải Trí & Phim": [
-        "phim chiếu rạp mới 2026",
-        "Netflix new releases today",
-        "phim Hàn K-Drama mới",
+
+    "🎬 Giải Trí": [
+
+        "Netflix releases",
         "Hollywood movie news",
-        "tin sao celebrity Việt",
+        "Disney movie news",
+        "celebrity news",
+        "KDrama news",
         "Kpop news",
+        "music industry news",
     ],
+
     "⛩️ Anime & Manga": [
-        "anime season 2026 news",
-        "manga hot chapter release",
-        "One Piece latest news",
-        "light novel anime adaptation",
-        "Nhật Bản anime tin tức",
+
+        "anime news",
+        "manga news",
+        "One Piece news",
+        "Jujutsu Kaisen news",
+        "anime adaptation",
+        "light novel adaptation",
+        "Japanese anime industry",
     ],
+
     "⚽ Thể Thao": [
-        "bóng đá Việt Nam tin mới nhất",
-        "Premier League news",
-        "Champions League results",
-        "Esports LMHT VCS tin",
-        "tin chuyển nhượng bóng đá",
-        "Olympic thể thao tin",
+
+        "football news",
+        "Premier League",
+        "Champions League",
+        "transfer news",
+        "Vietnam football",
+        "Esports news",
+        "VCS LMHT",
     ],
+
     "📈 Crypto & Tài Chính": [
-        "Bitcoin price news today",
-        "Altcoin DeFi news",
-        "VN-Index chứng khoán hôm nay",
-        "vàng tỷ giá ngoại tệ",
-        "kinh tế thế giới tin mới",
+
+        "Bitcoin news",
+        "Ethereum news",
+        "crypto market",
+        "DeFi news",
+        "stock market news",
+        "VN-Index",
+        "gold price",
+        "USD exchange rate",
+        "global economy",
     ],
+
     "🏥 Sức Khỏe": [
-        "dịch bệnh cúm virus mới",
-        "dinh dưỡng sức khỏe mới",
-        "thuốc điều trị nghiên cứu mới",
-        "tin y tế Việt Nam",
-        "thể dục fitness trend",
+
+        "health news",
+        "medical breakthrough",
+        "virus outbreak",
+        "fitness trend",
+        "nutrition research",
+        "longevity research",
     ],
+
+    "🎮 Gaming": [
+
+        "gaming news",
+        "Steam game news",
+        "PlayStation news",
+        "Xbox news",
+        "Nintendo news",
+        "gacha game news",
+        "Wuthering Waves news",
+        "Genshin Impact news",
+    ]
 }
 
-GROUP_COLORS: dict[str, int] = {
-    "🤖 AI & Công Nghệ":    0x00CFFF,
-    "🇻🇳 Tin Việt Nam":      0xFF4444,
-    "🎬 Giải Trí & Phim":   0xFF9900,
-    "⛩️ Anime & Manga":     0xFF69B4,
-    "⚽ Thể Thao":           0x44FF88,
+GROUP_COLORS = {
+    "🤖 AI & Công Nghệ": 0x00CFFF,
+    "🇻🇳 Việt Nam": 0xFF4444,
+    "🎬 Giải Trí": 0xFF9900,
+    "⛩️ Anime & Manga": 0xFF69B4,
+    "⚽ Thể Thao": 0x44FF88,
     "📈 Crypto & Tài Chính": 0xF7D000,
-    "🏥 Sức Khỏe":           0x88FFCC,
+    "🏥 Sức Khỏe": 0x88FFCC,
+    "🎮 Gaming": 0x9966FF,
 }
 
-# =========================
-# PERSISTENT STATE
-# =========================
-def load_state() -> dict:
-    try:
-        with open(Config.STATE_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {"last_sent_slot": -1}
+# =========================================================
+# DISCORD
+# =========================================================
 
-def save_state(state: dict):
-    try:
-        with open(Config.STATE_FILE, "w") as f:
-            json.dump(state, f)
-    except Exception as e:
-        logger.error(f"Lỗi lưu state: {e}")
+intents = discord.Intents.default()
+intents.message_content = True
 
-# =========================
-# TIME UTILS (VN)
-# =========================
-def get_vn_now() -> datetime:
-    return datetime.utcnow() + timedelta(hours=Config.TIMEZONE_OFFSET)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
+)
 
-def format_time_range(start: datetime, end: datetime) -> str:
-    return f"{start.strftime('%H:%M %d/%m/%Y')} → {end.strftime('%H:%M %d/%m/%Y')}"
+# =========================================================
+# GLOBALS
+# =========================================================
 
-def get_current_slot() -> int:
-    hour = get_vn_now().hour
-    for slot in sorted(Config.SLOTS, reverse=True):
+semaphore = asyncio.Semaphore(
+    Config.MAX_PARALLEL_REQUESTS
+)
+
+CACHE: Dict[str, Dict[str, Any]] = {}
+
+last_sent_slot = -1
+
+# =========================================================
+# TIME UTILS
+# =========================================================
+
+def vn_now():
+
+    return datetime.utcnow() + timedelta(
+        hours=Config.TIMEZONE_OFFSET
+    )
+
+def format_range(start, end):
+
+    return (
+        f"{start.strftime('%H:%M %d/%m/%Y')} "
+        f"→ "
+        f"{end.strftime('%H:%M %d/%m/%Y')}"
+    )
+
+def current_slot():
+
+    hour = vn_now().hour
+
+    for slot in reversed(Config.SLOTS):
+
         if hour >= slot:
             return slot
-    return Config.SLOTS[-1]
 
-def get_slot_range(slot: int) -> tuple[datetime, datetime]:
-    now = get_vn_now()
-    end = now.replace(hour=slot, minute=0, second=0, microsecond=0)
-    start = end - timedelta(hours=6)
-    if start.day != end.day and slot == 0:
-        start = (end - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
-    return start, end
+    return 18
 
-def get_next_slot_time() -> datetime:
-    now = get_vn_now()
-    current_slot = get_current_slot()
+def next_slot_time():
+
+    now = vn_now()
+
+    cur = current_slot()
+
     for slot in Config.SLOTS:
-        if slot > current_slot:
-            return now.replace(hour=slot, minute=0, second=0, microsecond=0)
-    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        if slot > cur:
+
+            return now.replace(
+                hour=slot,
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+
+    return (
+        now + timedelta(days=1)
+    ).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
 
 async def wait_until_next_slot():
-    next_time = get_next_slot_time()
-    wait_sec = max((next_time - get_vn_now()).total_seconds(), 0)
-    logger.info(f"⏳ Chờ {wait_sec:.0f}s đến mốc {next_time.strftime('%H:%M')}")
-    await asyncio.sleep(wait_sec)
 
-# =========================
-# RETRY HELPER
-# =========================
-async def with_retry(coro_fn, retries: int = Config.MAX_RETRIES, delay: float = Config.RETRY_DELAY_SECONDS):
-    """Chạy coroutine với exponential backoff."""
-    for attempt in range(retries):
-        try:
-            return await coro_fn()
-        except Exception as e:
-            if attempt == retries - 1:
-                logger.error(f"Hết retry sau {retries} lần: {e}")
-                return None
-            wait = delay * (2 ** attempt)
-            logger.warning(f"Retry {attempt+1}/{retries} sau {wait:.1f}s — lỗi: {e}")
-            await asyncio.sleep(wait)
-    return None
+    nxt = next_slot_time()
 
-# =========================
-# TAVILY SEARCH
-# =========================
-async def search_tavily(session: aiohttp.ClientSession, query: str, start: datetime, end: datetime):
-    if not TAVILY_API_KEY:
+    seconds = max(
+        (nxt - vn_now()).total_seconds(),
+        0
+    )
+
+    logger.info(f"Waiting {seconds:.0f}s")
+
+    await asyncio.sleep(seconds)
+
+# =========================================================
+# STATE
+# =========================================================
+
+def load_state():
+
+    global last_sent_slot
+
+    try:
+
+        with open(Config.STATE_FILE, "r") as f:
+
+            data = json.load(f)
+
+            last_sent_slot = data.get(
+                "last_sent_slot",
+                -1
+            )
+
+    except:
+        last_sent_slot = -1
+
+def save_state():
+
+    try:
+
+        with open(Config.STATE_FILE, "w") as f:
+
+            json.dump({
+                "last_sent_slot": last_sent_slot
+            }, f)
+
+    except Exception as e:
+
+        logger.error(e)
+
+# =========================================================
+# CACHE
+# =========================================================
+
+def make_cache_key(topic, start, end):
+
+    raw = f"{topic}_{start}_{end}"
+
+    return hashlib.md5(
+        raw.encode()
+    ).hexdigest()
+
+def get_cache(key):
+
+    if key not in CACHE:
         return None
 
-    async def _call():
-        payload = {
-            "api_key": TAVILY_API_KEY,
-            "query": query,
-            "search_depth": "advanced",
-            "max_results": 5,
-            "include_answer": True,
-            "days": Config.SEARCH_INTERVAL_HOURS // 24 or 1,  # Tavily dùng "days", không phải timestamp
-        }
-        async with session.post(
-            "https://api.tavily.com/search",
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+    item = CACHE[key]
 
-    return await with_retry(_call)
+    if time.time() - item["time"] > Config.CACHE_EXPIRE:
 
-# =========================
-# GROQ SUMMARIZE
-# =========================
-async def summarize_groq(
-    session: aiohttp.ClientSession,
-    search_data: dict,
-    start: datetime,
-    end: datetime,
-    topic: str,
-) -> str:
-    if not GROQ_API_KEY or not search_data:
-        return ""
+        del CACHE[key]
 
-    time_range_str = format_time_range(start, end)
-    system_prompt = (
-        f'Bạn là chuyên gia tổng hợp tin tức (tiếng Việt). '
-        f'Chủ đề: "{topic}" | Khung giờ: {time_range_str}. '
-        f'Chọn 2–3 tin nổi bật nhất. Mỗi tin: tiêu đề in đậm, tóm tắt 2 câu, link. '
-        f'Dùng markdown và emoji. Nếu không có tin mới, trả về chuỗi rỗng.'
+        return None
+
+    return item["data"]
+
+def set_cache(key, value):
+
+    CACHE[key] = {
+        "time": time.time(),
+        "data": value
+    }
+
+# =========================================================
+# SSE PARSER
+# =========================================================
+
+async def parse_openai_response(resp):
+
+    content_type = (
+        resp.headers.get(
+            "Content-Type",
+            ""
+        ).lower()
     )
-    user_content = f"Tổng quan: {search_data.get('answer', '')}\n"
-    for idx, res in enumerate(search_data.get("results", [])[:5], 1):
-        user_content += (
-            f"\n{idx}. {res['title']}\n"
-            f"   {res['content'][:400]}\n"
-            f"   🔗 {res['url']}\n"
+
+    logger.info(
+        f"Content-Type: {content_type}"
+    )
+
+    # =====================================================
+    # JSON
+    # =====================================================
+
+    if "application/json" in content_type:
+
+        return await resp.json()
+
+    # =====================================================
+    # SSE STREAM
+    # =====================================================
+
+    elif "text/event-stream" in content_type:
+
+        full_text = ""
+
+        async for raw_line in resp.content:
+
+            try:
+
+                line = raw_line.decode(
+                    "utf-8",
+                    errors="ignore"
+                ).strip()
+
+            except:
+                continue
+
+            if not line:
+                continue
+
+            if not line.startswith("data:"):
+                continue
+
+            data_str = line[5:].strip()
+
+            if data_str == "[DONE]":
+                break
+
+            try:
+
+                chunk = json.loads(data_str)
+
+                choices = chunk.get(
+                    "choices",
+                    []
+                )
+
+                if not choices:
+                    continue
+
+                choice = choices[0]
+
+                delta = (
+                    choice.get("delta", {})
+                    .get("content")
+                )
+
+                if delta is None:
+
+                    delta = (
+                        choice.get("message", {})
+                        .get("content", "")
+                    )
+
+                if delta:
+                    full_text += delta
+
+            except:
+                continue
+
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": full_text
+                    }
+                }
+            ]
+        }
+
+    # =====================================================
+    # UNKNOWN
+    # =====================================================
+
+    else:
+
+        text = await resp.text()
+
+        raise Exception(
+            f"Unsupported content type: "
+            f"{content_type}\n{text[:500]}"
         )
 
-    async def _call():
-        async with session.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
+# =========================================================
+# API CALL
+# =========================================================
+
+async def make_api_call(
+    session,
+    messages,
+    retry=0
+):
+
+    async with semaphore:
+
+        try:
+
+            payload = {
+                "model": MODEL_NAME,
+                "messages": messages,
                 "temperature": 0.4,
-                "max_tokens": 800,
-            },
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            return data["choices"][0]["message"]["content"]
+                "max_tokens": Config.MAX_TOKENS,
+                "stream": False
+            }
 
-    result = await with_retry(_call)
-    return result or ""
+            async with session.post(
+                f"{API_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=aiohttp.ClientTimeout(
+                    total=Config.REQUEST_TIMEOUT,
+                    sock_read=Config.REQUEST_TIMEOUT
+                )
+            ) as resp:
 
-# =========================
-# FALLBACK API COMPATIBLE
-# =========================
-async def summarize_compatible(
-    session: aiohttp.ClientSession,
-    topic: str,
-    start: datetime,
-    end: datetime,
-) -> str:
-    if not API_BASE or not API_KEY:
-        return ""
+                # =========================================
+                # RETRY STATUS
+                # =========================================
 
-    time_range = format_time_range(start, end)
-    prompt = (
-        f"Tìm tin tức về '{topic}' trong khung giờ {time_range} (giờ VN). "
-        f"Trả lời tiếng Việt, mỗi tin có tiêu đề, tóm tắt 2 câu, link. "
-        f"Nếu không có tin, trả lời 'KHÔNG CÓ TIN'."
+                if resp.status in [429, 500, 502, 503, 504]:
+
+                    if retry < Config.MAX_RETRIES:
+
+                        delay = (
+                            Config.RETRY_DELAY
+                            * (2 ** retry)
+                        )
+
+                        logger.warning(
+                            f"Retry {retry+1} "
+                            f"after {delay}s "
+                            f"(status {resp.status})"
+                        )
+
+                        await asyncio.sleep(delay)
+
+                        return await make_api_call(
+                            session,
+                            messages,
+                            retry + 1
+                        )
+
+                    return None
+
+                if resp.status != 200:
+
+                    logger.error(
+                        f"API Error {resp.status}"
+                    )
+
+                    logger.error(
+                        await resp.text()
+                    )
+
+                    return None
+
+                return await parse_openai_response(resp)
+
+        except asyncio.TimeoutError:
+
+            logger.warning(
+                f"Timeout retry {retry+1}"
+            )
+
+            if retry < Config.MAX_RETRIES:
+
+                await asyncio.sleep(
+                    Config.RETRY_DELAY
+                    * (2 ** retry)
+                )
+
+                return await make_api_call(
+                    session,
+                    messages,
+                    retry + 1
+                )
+
+            return None
+
+        except Exception as e:
+
+            logger.error(f"API Error: {e}")
+
+            if retry < Config.MAX_RETRIES:
+
+                await asyncio.sleep(
+                    Config.RETRY_DELAY
+                    * (2 ** retry)
+                )
+
+                return await make_api_call(
+                    session,
+                    messages,
+                    retry + 1
+                )
+
+            return None
+
+# =========================================================
+# SEARCH ONE TOPIC
+# =========================================================
+
+async def search_topic(
+    session,
+    topic,
+    start,
+    end
+):
+
+    cache_key = make_cache_key(
+        topic,
+        start,
+        end
     )
 
-    async def _call():
-        async with session.post(
-            f"{API_BASE}/chat/completions",
-            headers={"Authorization": f"Bearer {API_KEY}"},
-            json={
+    cached = get_cache(cache_key)
+
+    if cached:
+        return cached
+
+    time_range = format_range(start, end)
+
+    messages = [
+
+        {
+            "role": "system",
+            "content": """
+Bạn là AI săn tin tức toàn cầu.
+
+Yêu cầu:
+- Trả lời tiếng Việt
+- Tìm tin HOT nhất
+- Ưu tiên nguồn uy tín
+- Markdown đẹp
+"""
+        },
+
+        {
+            "role": "user",
+            "content": f"""
+Tìm tin mới nhất về:
+
+{topic}
+
+Khung giờ:
+{time_range}
+
+Yêu cầu:
+- 2-3 tin nổi bật
+- tiêu đề
+- tóm tắt ngắn
+- link nguồn
+- markdown
+"""
+        }
+    ]
+
+    result = await make_api_call(
+        session,
+        messages
+    )
+
+    if not result:
+        return ""
+
+    try:
+
+        content = (
+            result["choices"][0]
+            ["message"]["content"]
+        )
+
+        if len(content) < 50:
+            return ""
+
+        set_cache(
+            cache_key,
+            content
+        )
+
+        return content
+
+    except:
+        return ""
+
+# =========================================================
+# BUILD GROUP DIGEST
+# =========================================================
+
+async def build_group_digest(
+    group_name,
+    topics,
+    start,
+    end,
+    session
+):
+
+    tasks = [
+
+        search_topic(
+            session,
+            topic,
+            start,
+            end
+        )
+
+        for topic in topics
+    ]
+
+    results = await asyncio.gather(
+        *tasks,
+        return_exceptions=True
+    )
+
+    valid = []
+
+    seen = set()
+
+    for r in results:
+
+        if not isinstance(r, str):
+            continue
+
+        if len(r) < 50:
+            continue
+
+        key = r[:100].lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        valid.append(r)
+
+    return {
+        "group": group_name,
+        "content": "\n\n---\n\n".join(valid)
+    }
+
+# =========================================================
+# BUILD ALL DIGEST
+# =========================================================
+
+async def build_all_digest(
+    start,
+    end
+):
+
+    connector = aiohttp.TCPConnector(
+        limit=Config.TCP_LIMIT,
+        ttl_dns_cache=Config.DNS_CACHE,
+        ssl=False
+    )
+
+    async with aiohttp.ClientSession(
+        connector=connector
+    ) as session:
+
+        tasks = [
+
+            build_group_digest(
+                group,
+                topics,
+                start,
+                end,
+                session
+            )
+
+            for group, topics
+            in TOPIC_GROUPS.items()
+        ]
+
+        results = await asyncio.gather(
+            *tasks,
+            return_exceptions=True
+        )
+
+    final = []
+
+    for r in results:
+
+        if not isinstance(r, dict):
+            continue
+
+        if not r["content"]:
+            continue
+
+        final.append(r)
+
+    return final
+
+# =========================================================
+# SPLIT MESSAGE
+# =========================================================
+
+def split_message(text):
+
+    chunks = []
+
+    while len(text) > Config.MAX_DISCORD_LENGTH:
+
+        split_at = text.rfind(
+            "\n",
+            0,
+            Config.MAX_DISCORD_LENGTH
+        )
+
+        if split_at == -1:
+            split_at = Config.MAX_DISCORD_LENGTH
+
+        chunks.append(text[:split_at])
+
+        text = text[split_at:]
+
+    chunks.append(text)
+
+    return chunks
+
+# =========================================================
+# SEND DIGEST
+# =========================================================
+
+async def send_digest(
+    channel,
+    start,
+    end
+):
+
+    data = await build_all_digest(
+        start,
+        end
+    )
+
+    total_topics = sum(
+        len(v)
+        for v in TOPIC_GROUPS.values()
+    )
+
+    header = discord.Embed(
+        title="📰 TECH DIGEST",
+        description=(
+            f"🕐 {format_range(start, end)}\n"
+            f"📂 {len(data)} nhóm\n"
+            f"📌 {total_topics} chủ đề"
+        ),
+        color=0x00ffcc,
+        timestamp=datetime.utcnow()
+    )
+
+    await channel.send(embed=header)
+
+    await asyncio.sleep(1)
+
+    # =====================================================
+    # SEND GROUPS
+    # =====================================================
+
+    for item in data:
+
+        group = item["group"]
+
+        content = item["content"]
+
+        if not content:
+            continue
+
+        embed = discord.Embed(
+            title=group,
+            color=GROUP_COLORS.get(
+                group,
+                0xaaaaaa
+            )
+        )
+
+        await channel.send(embed=embed)
+
+        chunks = split_message(content)
+
+        for chunk in chunks:
+
+            await channel.send(chunk)
+
+            await asyncio.sleep(
+                Config.DISCORD_DELAY
+            )
+
+# =========================================================
+# AUTO SCHEDULER
+# =========================================================
+
+async def auto_scheduler():
+
+    global last_sent_slot
+
+    await bot.wait_until_ready()
+
+    channel = bot.get_channel(CHANNEL_ID)
+
+    if not channel:
+
+        logger.error(
+            "Channel not found"
+        )
+
+        return
+
+    while not bot.is_closed():
+
+        slot = current_slot()
+
+        if slot != last_sent_slot:
+
+            end = vn_now()
+
+            start = end - timedelta(
+                hours=Config.SEARCH_INTERVAL_HOURS
+            )
+
+            logger.info(
+                f"Sending slot {slot}"
+            )
+
+            try:
+
+                await send_digest(
+                    channel,
+                    start,
+                    end
+                )
+
+                last_sent_slot = slot
+
+                save_state()
+
+            except Exception as e:
+
+                logger.error(e)
+
+        await wait_until_next_slot()
+
+# =========================================================
+# COMMANDS
+# =========================================================
+
+@bot.command(name="news")
+async def news(ctx):
+
+    if ctx.channel.id != CHANNEL_ID:
+
+        await ctx.send(
+            f"❌ Chỉ dùng trong <#{CHANNEL_ID}>"
+        )
+
+        return
+
+    async with ctx.typing():
+
+        now = vn_now()
+
+        start = now - timedelta(hours=6)
+
+        await send_digest(
+            ctx.channel,
+            start,
+            now
+        )
+
+@bot.command(name="ping")
+async def ping(ctx):
+
+    await ctx.send(
+        f"🏓 {round(bot.latency * 1000)}ms"
+    )
+
+@bot.command(name="status")
+async def status(ctx):
+
+    total_topics = sum(
+        len(v)
+        for v in TOPIC_GROUPS.values()
+    )
+
+    embed = discord.Embed(
+        title="🤖 Bot Status",
+        color=0x00ff00,
+        timestamp=datetime.utcnow()
+    )
+
+    embed.add_field(
+        name="Latency",
+   
+            return now.replace(
+                hour=slot,
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+
+    return (
+        now + timedelta(days=1)
+    ).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
+
+async def wait_until_next_slot():
+
+    nxt = next_slot_time()
+
+    seconds = max(
+        (nxt - vn_now()).total_seconds(),
+        0
+    )
+
+    logger.info(f"Waiting {seconds:.0f}s")
+
+    await asyncio.sleep(seconds)
+
+# =========================================================
+# SSE PARSER
+# =========================================================
+
+async def parse_openai_response(resp):
+
+    content_type = (
+        resp.headers.get(
+            "Content-Type",
+            ""
+        ).lower()
+    )
+
+    logger.info(f"Content-Type: {content_type}")
+
+    # =====================================================
+    # JSON
+    # =====================================================
+
+    if "application/json" in content_type:
+
+        return await resp.json()
+
+    # =====================================================
+    # STREAM
+    # =====================================================
+
+    elif "text/event-stream" in content_type:
+
+        full_text = ""
+
+        async for raw_line in resp.content:
+
+            try:
+                line = raw_line.decode(
+                    "utf-8",
+                    errors="ignore"
+                ).strip()
+
+            except:
+                continue
+
+            if not line:
+                continue
+
+            if not line.startswith("data:"):
+                continue
+
+            data_str = line[5:].strip()
+
+            if data_str == "[DONE]":
+                break
+
+            try:
+
+                chunk = json.loads(data_str)
+
+                choices = chunk.get(
+                    "choices",
+                    []
+                )
+
+                if not choices:
+                    continue
+
+                choice = choices[0]
+
+                delta = (
+                    choice.get("delta", {})
+                    .get("content")
+                )
+
+                if delta is None:
+
+                    delta = (
+                        choice.get("message", {})
+                        .get("content", "")
+                    )
+
+                if delta:
+                    full_text += delta
+
+            except Exception:
+                continue
+
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": full_text
+                    }
+                }
+            ]
+        }
+
+    else:
+
+        text = await resp.text()
+
+        raise Exception(
+            f"Unsupported content type: "
+            f"{content_type}\n{text[:500]}"
+        )
+
+# =========================================================
+# RETRY REQUEST
+# =========================================================
+
+async def make_api_call(
+    session,
+    messages,
+    retry=0
+):
+
+    async with semaphore:
+
+        try:
+
+            payload = {
                 "model": MODEL_NAME,
-                "messages": [
-                    {"role": "system", "content": "Bạn là trợ lý tổng hợp tin tức."},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.3,
-                "max_tokens": 800,
-            },
-            timeout=aiohttp.ClientTimeout(total=Config.API_TIMEOUT_SECONDS),
-        ) as resp:
-            resp.raise_for_status()
+                "messages": messages,
+                "temperature": 0.4,
+                "max_tokens": 2000,
+                "stream": False
+            }
+
+            async with session.post(
+                f"{API_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=aiohttp.ClientTimeout(
+                    total=Config.REQUEST_TIMEOUT,
+                    sock_read=Config.REQUEST_TIMEOUT
+                )
+            ) as resp:
+
+                if resp.status == 429:
+
+                    if retry < Config.MAX_RETRIES:
+
+                        delay = (
+                            Config.RETRY_DELAY
+                            * (2 ** retry)
+                        )
+
+                        logger.warning(
+                            f"429 retry {retry+1}"
+                        )
+
+                        await asyncio.sleep(delay)
+
+                        return await make_api_call(
+                            session,
+                            messages,
+                            retry + 1
+                        )
+
+                    return None
+
+                if resp.status >= 500:
+
+                    if retry < Config.MAX_RETRIES:
+
+                        delay = (
+                            Config.RETRY_DELAY
+                            * (2 ** retry)
+                        )
+
+                        logger.warning(
+                            f"5xx retry {retry+1}"
+                        )
+
+                        await asyncio.sleep(delay)
+
+                        return await make_api_call(
+                            session,
+                            messages,
+                            retry + 1
+                        )
+
+                    return None
+
+                if resp.status != 200:
+
+                    logger.error(
+                        f"API Error {resp.status}"
+                    )
+
+                    logger.error(await resp.text())
+
+                    return None
+
+                return await parse_openai_response(resp)
+
+        except asyncio.TimeoutError:
+
+            logger.warning("Timeout")
+
+            if retry < Config.MAX_RETRIES:
+
+                await asyncio.sleep(
+                    Config.RETRY_DELAY * (2 ** retry)
+                )
+
+                return await make_api_call(
+                    session,
+                    messages,
+                    retry + 1
+                )
+
+            return None
+
+        except Exception as e:
+
+            logger.error(f"API Error: {e}")
+
+            if retry < Config.MAX_RETRIES:
+
+                await asyncio.sleep(
+                    Config.RETRY_DELAY * (2 ** retry)
+                )
+
+                return await make_api_call(
+                    session,
+                    messages,
+                    retry + 1
+                )
+
+            return None
+
+# =========================================================
+# SEARCH ONE TOPIC
+# =========================================================
+
+async def search_topic(
+    session,
+    topic,
+    start,
+    end
+):
+
+    time_range = format_range(start, end)
+
+    messages = [
+
+        {
+            "role": "system",
+            "content": (
+                "Bạn là AI săn tin tức toàn cầu. "
+                "Trả lời tiếng Việt. "
+                "Tìm tin HOT nhất."
+            )
+        },
+
+        {
+            "role": "user",
+            "content": f"""
+Tìm tin mới nhất về:
+
+{topic}
+
+Khung giờ:
+{time_range}
+
+Yêu cầu:
+- 2-3 tin nổi bật
+- tiêu đề
+- tóm tắt ngắn
+- link nguồn
+- markdown
+"""
+        }
+    ]
+
+    result = await make_api_call(
+        session,
+        messages
+    )
+
+    if not result:
+        return ""
+
+    try:
+
+        content = (
+            result["choices"][0]
+            ["message"]["content"]
+        )
+
+        if len(content) < 50:
+            return ""
+
+        return content
+
+    except:
+        return ""
+
+# =========================================================
+# BUILD DIGEST
+# =========================================================
+
+async def build_digest(start, end):
+
+    connector = aiohttp.TCPConnector(
+        limit=50,
+        ssl=False
+    )
+
+    async with aiohttp.ClientSession(
+        connector=connector
+    ) as session:
+
+        tasks = [
+
+            search_topic(
+                session,
+                topic,
+                start,
+                end
+            )
+
+            for topic in TOPICS
+        ]
+
+        results = await asyncio.gather(
+            *tasks,
+            return_exceptions=True
+        )
+
+    valid = []
+
+    seen = set()
+
+    for r in results:
+
+        if not isinstance(r, str):
+            continue
+
+        if len(r) < 50:
+            continue
+
+        key = r[:100].lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        valid.append(r)
+
+    if not valid:
+
+        return "⚠️ Không có tin mới."
+
+    return "\n\n---\n\n".join(valid)
+
+# =========================================================
+# SPLIT
+# =========================================================
+
+def split_message(text):
+
+    chunks = []
+
+    while len(text) > Config.MAX_DISCORD_LENGTH:
+
+        split_at = text.rfind(
+            "\n",
+            0,
+            Config.MAX_DISCORD_LENGTH
+        )
+
+        if split_at == -1:
+            split_at = Config.MAX_DISCORD_LENGTH
+
+        chunks.append(text[:split_at])
+
+        text = text[split_at:]
+
+    chunks.append(text)
+
+    return chunks
+
+# =========================================================
+# SEND DIGEST
+# =========================================================
+
+async def send_digest(channel, start, end):
+
+    digest = await build_digest(
+        start,
+        end
+    )
+
+    header = discord.Embed(
+        title="📰 TECH DIGEST",
+        description=format_range(start, end),
+        color=0x00ffcc,
+        timestamp=datetime.utcnow()
+    )
+
+    await channel.send(embed=header)
+
+    chunks = split_message(digest)
+
+    for chunk in chunks:
+
+        await channel.send(chunk)
+
+        await asyncio.sleep(
+            Config.DISCORD_DELAY
+        )
+
+# =========================================================
+# AUTO SCHEDULER
+# =========================================================
+
+async def auto_scheduler():
+
+    global last_sent_slot
+
+    await bot.wait_until_ready()
+
+    channel = bot.get_channel(CHANNEL_ID)
+
+    if not channel:
+
+        logger.error("Channel not found")
+
+        return
+
+    while not bot.is_closed():
+
+        slot = current_slot()
+
+        if slot != last_sent_slot:
+
+            end = vn_now()
+
+            start = end - timedelta(
+                hours=Config.SEARCH_INTERVAL_HOURS
+            )
+
+            logger.info(
+                f"Sending slot {slot}"
+            )
+
+            try:
+
+                await send_digest(
+                    channel,
+                    start,
+                    end
+                )
+
+                last_sent_slot = slot
+
+            except Exception as e:
+
+                logger.error(e)
+
+        await wait_until_next_slot()
+
+# =========================================================
+# COMMANDS
+# =========================================================
+
+@bot.command(name="news")
+async def news(ctx):
+
+    if ctx.channel.id != CHANNEL_ID:
+
+        await ctx.send("❌ Wrong channel")
+
+        return
+
+    async with ctx.typing():
+
+        now = vn_now()
+
+        start = now - timedelta(hours=6)
+
+        await send_digest(
+            ctx.channel,
+            start,
+            now
+        )
+
+@bot.command(name="ping")
+async def ping(ctx):
+
+    await ctx.send(
+        f"🏓 {round(bot.latency * 1000)}ms"
+    )
+
+@bot.command(name="status")
+async def status(ctx):
+
+    embed = discord.Embed(
+        title="Bot Status",
+        color=0x00ff00
+    )
+
+    embed.add_field(
+        name="Latency",
+        value=f"{round(bot.latency * 1000)}ms"
+    )
+
+    embed.add_field(
+        name="Parallel",
+        value=str(
+            Config.MAX_PARALLEL_REQUESTS
+        )
+    )
+
+    embed.add_field(
+        name="Model",
+        value=MODEL_NAME,
+        inline=False
+    )
+
+    await ctx.send(embed=embed)
+
+# =========================================================
+# READY
+# =========================================================
+
+@bot.event
+async def on_ready():
+
+    logger.info(
+        f"Bot online: {bot.user}"
+    )
+
+    bot.loop.create_task(
+        auto_scheduler()
+    )
+
+# =========================================================
+# MAIN
+# =========================================================
+
+if __name__ == "__main__":
+
+    if not DISCORD_TOKEN:
+
+        raise Exception(
+            "Missing DISCORD_TOKEN"
+        )
+
+    if not API_KEY:
+
+        raise Exception(
+            "Missing API_KEY"
+        )
+
+    if not API_BASE:
+
+        raise Exception(
+            "Missing API_BASE"
+        )
+
+    bot.run(DISCORD_TOKEN)raise_for_status()
             data = await resp.json()
             return data["choices"][0]["message"]["content"]
 
