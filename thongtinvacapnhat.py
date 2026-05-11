@@ -557,13 +557,12 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN:
         logger.error("❌ Thiếu DISCORD_TOKEN trong .env")
         raise SystemExit(1)
+
     if not CHANNEL_ID:
         logger.error("❌ Thiếu CHANNEL_ID trong .env")
         raise SystemExit(1)
+
     bot.run(DISCORD_TOKEN)
-        wait_sec = 0
-    logger.info(f"Chờ {wait_sec:.0f}s đến mốc {next_time.strftime('%H:%M')}")
-    await asyncio.sleep(wait_sec)
 
 # =========================
 # XÁC ĐỊNH THỜI GIAN HIỆN TẠI (TỪ INTERNET)
