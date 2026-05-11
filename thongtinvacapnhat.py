@@ -32,7 +32,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 # OpenAI Compatible API
 API_BASE = os.getenv("API_BASE", "http://node1.minet.vn:26000/v1")
 API_KEY = os.getenv("API_KEY")
-MODEL_NAME = "deepseek-v4-pro-search-nothinking"  # Model mới, nhanh hơn
+MODEL_NAME = "DeepSeekV2/deepseek-v4-flash-search-nothinking"  # Model mới, nhanh hơn
 
 # Optional: Tavily fallback (nếu model search lỗi)
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
