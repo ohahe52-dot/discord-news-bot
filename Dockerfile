@@ -2,13 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Cài đặt dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy code
-COPY bot.py .
-COPY .env .
+# Chỉ copy file code, KHÔNG copy .env
+COPY thongtinvacapnhat.py .
 
-# Chạy bot
-CMD ["python", "bot.py"]
+# Lệnh chạy bot
+CMD ["python", "thongtinvacapnhat.py"]
