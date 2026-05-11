@@ -7,7 +7,7 @@ import os
 import logging
 import random
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 # =========================
 # LOGGING SETUP
@@ -43,14 +43,30 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 # CONFIGURATION
 # =========================
 class Config:
-    SEARCH_INTERVAL_HOURS = 3
+    SEARCH_INTERVAL_HOURS = 6           # *** ĐÃ ĐỔI THÀNH 6 GIỜ ***
     MAX_RETRIES = 3
     RETRY_DELAY_SECONDS = 5
-    API_TIMEOUT_SECONDS = 60
+    API_TIMEOUT_SECONDS = 90
     MAX_DISCORD_MESSAGE_LENGTH = 3900
     TEMPERATURE = 0.3
     TIMEZONE_OFFSET = 7
-    SLOTS = [0, 3, 6, 9, 12, 15, 18, 21]
+
+    # Các mốc giờ cố định (0, 6, 12, 18) theo giờ VN
+    SLOTS = [0, 6, 12, 18]
+
+    # Danh sách các chủ đề tìm kiếm đa dạng (sẽ chạy song song)
+    SEARCH_TOPICS = [
+        "AI news worldwide last 6 hours",
+        "AI news Vietnam last 6 hours",
+        "OpenAI announcement today",
+        "Google AI news today",
+        "Meta AI news today",
+        "Microsoft AI news today",
+        "NVIDIA AI news today",
+        "artificial intelligence breakthrough",
+        "Việt Nam AI trí tuệ nhân tạo mới nhất",
+        "AI robotics hardware release"
+    ]
 
 # =========================
 # DISCORD BOT
@@ -72,20 +88,24 @@ def format_time_range(start: datetime, end: datetime) -> str:
 
 def get_current_slot() -> int:
     hour = get_vn_now().hour
+    # Tìm mốc gần nhất nhưng không vượt quá giờ hiện tại
     for slot in sorted(Config.SLOTS, reverse=True):
         if hour >= slot:
             return slot
     return Config.SLOTS[-1]
 
 def get_slot_range(slot: int):
+    """Trả về khoảng thời gian 6 giờ tương ứng với mốc (slot)"""
     now = get_vn_now()
     end = now.replace(hour=slot, minute=0, second=0, microsecond=0)
+    # Nếu mốc là 0 (nửa đêm), start là 18h hôm qua
     if slot == 0:
-        start = end - timedelta(days=1, hours=3)
+        start = end - timedelta(hours=6)
     else:
-        start = end - timedelta(hours=3)
+        start = end - timedelta(hours=6)
+    # Xử lý trường hợp gần mốc
     if start > end:
-        start = end - timedelta(hours=3)
+        start = end - timedelta(hours=6)
     return start, end
 
 def get_next_slot_time():
@@ -93,12 +113,10 @@ def get_next_slot_time():
     current_slot = get_current_slot()
     for slot in Config.SLOTS:
         if slot > current_slot:
-            next_slot = slot
-            break
-    else:
-        next_slot = 0
-        return now.replace(hour=next_slot, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    return now.replace(hour=next_slot, minute=0, second=0, microsecond=0)
+            return now.replace(hour=slot, minute=0, second=0, microsecond=0)
+    # Nếu đã qua mốc cuối (18h), chuyển sang mốc 0h ngày mai
+    next_day = now + timedelta(days=1)
+    return next_day.replace(hour=0, minute=0, second=0, microsecond=0)
 
 async def wait_until_next_slot():
     next_time = get_next_slot_time()
@@ -110,7 +128,17 @@ async def wait_until_next_slot():
     await asyncio.sleep(wait_sec)
 
 # =========================
-# API COMPATIBLE (FALLBACK)
+# XÁC ĐỊNH THỜI GIAN HIỆN TẠI (TỪ INTERNET)
+# =========================
+async def get_current_time_from_web() -> str:
+    """Lấy thời gian hiện tại từ một API bên ngoài hoặc từ Gemini (có search)"""
+    # Cách đơn giản: dùng datetime hệ thống (đã offset VN)
+    vn_now = get_vn_now()
+    return vn_now.strftime("%A, %d/%m/%Y %H:%M:%S")
+    # Nếu muốn chính xác tuyệt đối, có thể gọi API worldtime, nhưng không cần thiết
+
+# =========================
+# API COMPATIBLE (FALLBACK) - HỖ TRỢ SONG SONG
 # =========================
 async def make_api_call(session: aiohttp.ClientSession, messages: list, retry_count: int = 0) -> Optional[Dict[str, Any]]:
     if not API_KEY or not API_BASE:
@@ -141,39 +169,48 @@ async def make_api_call(session: aiohttp.ClientSession, messages: list, retry_co
         logger.error(f"API call failed: {e}")
         return None
 
-async def get_news_compatible(start: datetime, end: datetime) -> str:
-    """Dùng API compatible, tìm tin trong khoảng start → end (VN time)"""
+async def search_single_topic_compatible(session: aiohttp.ClientSession, topic: str, start: datetime, end: datetime) -> str:
+    """Tìm kiếm một chủ đề bằng API compatible (không dùng Tavily)"""
+    time_range_str = format_time_range(start, end)
+    system_prompt = f"""Bạn là AI săn tin công nghệ, có khả năng tìm kiếm internet.
+Yêu cầu: Phản hồi bằng TIẾNG VIỆT. Tìm tin tức liên quan đến chủ đề: {topic}
+Khung giờ: {time_range_str} (giờ Việt Nam).
+- Ưu tiên nguồn uy tín: TechCrunch, The Verge, Reuters, Bloomberg, VnExpress, Vietnam+,...
+- Mỗi tin cần có: tiêu đề, tóm tắt 2 câu, link nguồn.
+- Nếu không có tin, trả lời 'Không tìm thấy tin mới cho {topic}'.
+
+Định dạng markdown, emoji."""
+    user_prompt = f"Tìm tin tức {topic} trong {time_range_str}."
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    result = await make_api_call(session, messages)
+    if result and "choices" in result:
+        content = result["choices"][0]["message"]["content"]
+        return content if len(content) > 50 else ""
+    return ""
+
+async def get_news_compatible_parallel(start: datetime, end: datetime) -> str:
+    """Chạy song song nhiều chủ đề với API compatible, sau đó tổng hợp"""
     async with aiohttp.ClientSession() as session:
-        time_range_str = format_time_range(start, end)
-        system_prompt = f"""Bạn là AI săn tin công nghệ, có khả năng tìm kiếm internet.
-Yêu cầu: Phản hồi bằng tiếng việt, tìm các bài báo/tin tức công nghệ được công bố trong khung giờ CHÍNH XÁC sau:
-Khoảng thời gian: {time_range_str} (giờ Việt Nam, UTC+7)
-
-**QUAN TRỌNG - NGUỒN TIN ĐA DẠNG:**
-- BẮT BUỘC lấy tin từ NHIỀU nguồn khác nhau, không chỉ một vài trang.
-- Ưu tiên các trang báo công nghệ uy tín toàn cầu: TechCrunch, The Verge, Ars Technica, Wired, ZDNet, CNET, Reuters, Bloomberg, Associated Press, The Next Web, PCMag, Tom's Hardware, AnandTech, IEEE Spectrum, MIT Technology Review.
-- Có thể lấy từ blog chính thức của công ty (OpenAI, Google, Microsoft, Nvidia) hoặc các nền tảng khoa học (arXiv, Nature) nếu có tin mới.
-- **HẠN CHẾ TỐI ĐA** lấy từ các bản tin tổng hợp dạng newsletter (ví dụ: The Rundown AI, TLDR, Import AI) – chỉ dùng khi không còn nguồn nào khác.
-
-**NỘI DUNG ƯU TIÊN:**
-AI, phần cứng (GPU/CPU), robot, bảo mật, không gian, năng lượng, viễn thông.
-
-**YÊU CẦU ĐẦU RA:**
-Mỗi tin cần có: tiêu đề, tóm tắt 2-3 câu, link nguồn gốc (không phải link newsletter tổng hợp). Trình bày markdown với emoji, rõ ràng.
-"""
-        user_prompt = f"Hãy tìm tin công nghệ mới nhất trong khoảng {time_range_str}. Đảm bảo mỗi tin đều có link thật."
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-        result = await make_api_call(session, messages)
-        if result and "choices" in result:
-            content = result["choices"][0]["message"]["content"]
-            return content if len(content) > 100 else ""
-        return ""
+        tasks = []
+        for topic in Config.SEARCH_TOPICS:
+            tasks.append(search_single_topic_compatible(session, topic, start, end))
+        results = await asyncio.gather(*tasks)
+        # Lọc bỏ các kết quả rỗng
+        valid_results = [r for r in results if r and not r.startswith("Không tìm thấy")]
+        if not valid_results:
+            return "⚠️ Không tìm thấy tin tức nào trong 6 giờ qua."
+        # Gộp các kết quả lại (có thể gửi thẳng)
+        combined = "\n\n---\n\n".join(valid_results)
+        # Cắt nếu quá dài
+        if len(combined) > 3900:
+            combined = combined[:3900] + "..."
+        return combined
 
 # =========================
-# TAVILY + GROQ (ƯU TIÊN)
+# TAVILY + GROQ (CHÍNH) - HỖ TRỢ SONG SONG
 # =========================
 async def search_tavily(session: aiohttp.ClientSession, query: str, start: datetime, end: datetime) -> Optional[Dict[str, Any]]:
     if not TAVILY_API_KEY:
@@ -185,7 +222,7 @@ async def search_tavily(session: aiohttp.ClientSession, query: str, start: datet
             "api_key": TAVILY_API_KEY,
             "query": f"{query} after:{after_ts}",
             "search_depth": "advanced",
-            "max_results": 8,
+            "max_results": 6,
             "include_answer": True
         }
         async with session.post("https://api.tavily.com/search", json=payload, timeout=30) as resp:
@@ -194,18 +231,17 @@ async def search_tavily(session: aiohttp.ClientSession, query: str, start: datet
         logger.error(f"Tavily error: {e}")
         return None
 
-async def summarize_groq(session: aiohttp.ClientSession, search_data: Dict[str, Any], start: datetime, end: datetime) -> str:
+async def summarize_groq(session: aiohttp.ClientSession, search_data: Dict[str, Any], start: datetime, end: datetime, topic: str) -> str:
     if not GROQ_API_KEY or not search_data:
         return ""
     time_range_str = format_time_range(start, end)
-    system_prompt = f"""Bạn là chuyên gia tổng hợp tin công nghệ. Dựa vào dữ liệu tìm kiếm bên dưới (từ Tavily), hãy:
-- Chọn 3-5 tin HOT nhất được đăng trong khung thời gian: {time_range_str} (giờ Việt Nam).
-- Mỗi tin cần có: tiêu đề, tóm tắt 2 câu ngắn gọn, link nguồn.
-- Trình bày bằng markdown, có emoji, dễ đọc.
-- Nếu không có tin nào trong khung giờ này, trả lời: '📭 Không tìm thấy tin nổi bật trong khoảng {time_range_str}.' """
-    user_content = f"Khung giờ yêu cầu: {time_range_str}\n"
-    user_content += f"Tổng quan Tavily: {search_data.get('answer', '')}\n"
-    for idx, res in enumerate(search_data.get('results', [])[:8], 1):
+    system_prompt = f"""Bạn là chuyên gia tổng hợp tin công nghệ (tiếng Việt). Dựa vào dữ liệu tìm kiếm cho chủ đề "{topic}" trong khung {time_range_str}, hãy:
+- Chọn 2-3 tin HOT nhất (có thể ít hơn nếu không đủ).
+- Mỗi tin: tiêu đề, tóm tắt 2 câu, link nguồn.
+- Trình bày markdown, có emoji.
+- Nếu không có tin: trả về chuỗi rỗng."""
+    user_content = f"Khung giờ: {time_range_str}\nTổng quan: {search_data.get('answer', '')}\n"
+    for idx, res in enumerate(search_data.get('results', [])[:6], 1):
         user_content += f"\n{idx}. {res['title']}\n   {res['content'][:400]}\n   🔗 {res['url']}\n"
     try:
         async with session.post(
@@ -215,7 +251,7 @@ async def summarize_groq(session: aiohttp.ClientSession, search_data: Dict[str, 
                 "model": "llama-3.3-70b-versatile",
                 "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
                 "temperature": 0.5,
-                "max_tokens": 1200
+                "max_tokens": 1000
             },
             timeout=60
         ) as resp:
@@ -225,57 +261,76 @@ async def summarize_groq(session: aiohttp.ClientSession, search_data: Dict[str, 
         logger.error(f"Groq error: {e}")
         return ""
 
-async def get_news_tavily_groq(start: datetime, end: datetime) -> str:
-    async with aiohttp.ClientSession() as session:
-        topics = ["technology breakthrough", "AI news", "GPU CPU release", "cybersecurity", "space tech"]
-        for topic in topics:
-            res = await search_tavily(session, topic, start, end)
-            if res and res.get('results'):
-                summary = await summarize_groq(session, res, start, end)
-                if summary:
-                    return summary
-            await asyncio.sleep(1)
-        return ""
+async def search_single_topic_tavily(session: aiohttp.ClientSession, topic: str, start: datetime, end: datetime) -> str:
+    """Tìm kiếm một chủ đề bằng Tavily + Groq"""
+    res = await search_tavily(session, topic, start, end)
+    if res and res.get('results'):
+        summary = await summarize_groq(session, res, start, end, topic)
+        return summary if summary else ""
+    return ""
 
-async def get_news_tavily_only(start: datetime, end: datetime) -> str:
-    if not TAVILY_API_KEY:
-        return "⚠️ Bot đang bảo trì. Vui lòng thử lại sau 30 phút."
+async def get_news_tavily_groq_parallel(start: datetime, end: datetime) -> str:
+    """Chạy song song nhiều chủ đề với Tavily+Groq, tổng hợp kết quả"""
     async with aiohttp.ClientSession() as session:
-        topics = ["technology news", "AI breakthrough", "hardware release"]
-        all_articles = ""
-        for topic in topics:
-            res = await search_tavily(session, topic, start, end)
-            if res and res.get('results'):
-                for item in res.get('results', [])[:3]:
-                    all_articles += f"\n📰 {item['title']}\n{item['content'][:300]}\n🔗 {item['url']}\n---\n"
-            await asyncio.sleep(1)
-        if all_articles:
-            time_range_str = format_time_range(start, end)
-            return f"# 🌍 TECH DIGEST (Tạm thời - không AI)\nKhung: {time_range_str}\n\n{all_articles}"
-        return f"⚠️ Không tìm thấy tin tức trong khoảng {format_time_range(start, end)}."
+        tasks = []
+        for topic in Config.SEARCH_TOPICS:
+            tasks.append(search_single_topic_tavily(session, topic, start, end))
+        results = await asyncio.gather(*tasks)
+        valid = [r for r in results if r and len(r) > 50]
+        if not valid:
+            return ""
+        combined = "\n\n---\n\n".join(valid)
+        return combined if len(combined) > 100 else ""
 
 # =========================
-# MAIN DIGEST
+# FALLBACK TAVILY ONLY (KHÔNG AI)
+# =========================
+async def get_news_tavily_only_parallel(start: datetime, end: datetime) -> str:
+    if not TAVILY_API_KEY:
+        return "⚠️ Bot đang bảo trì. Vui lòng thử lại sau."
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for topic in Config.SEARCH_TOPICS:
+            tasks.append(search_tavily(session, topic, start, end))
+        search_results = await asyncio.gather(*tasks)
+        all_articles = ""
+        for res in search_results:
+            if res and res.get('results'):
+                for item in res.get('results', [])[:2]:
+                    all_articles += f"\n📰 {item['title']}\n{item['content'][:300]}\n🔗 {item['url']}\n---\n"
+        if all_articles:
+            time_range_str = format_time_range(start, end)
+            return f"# 🌍 TECH DIGEST (không AI)\nKhung: {time_range_str}\n{all_articles}"
+        return f"⚠️ Không tìm thấy tin tức trong {format_time_range(start, end)}."
+
+# =========================
+# MAIN DIGEST - TỔNG HỢP
 # =========================
 async def build_digest(start: datetime, end: datetime) -> str:
     logger.info(f"Build digest from {start} to {end}")
+    # 1. Thử Tavily+Groq song song
     if TAVILY_API_KEY and GROQ_API_KEY:
         try:
-            news = await get_news_tavily_groq(start, end)
+            news = await get_news_tavily_groq_parallel(start, end)
+            if news and len(news) > 200:
+                return news
+        except Exception as e:
+            logger.error(f"Tavily+Groq parallel error: {e}")
+    # 2. Thử API compatible song song
+    if API_BASE and API_KEY:
+        try:
+            news = await get_news_compatible_parallel(start, end)
             if news and len(news) > 100:
                 return news
         except Exception as e:
-            logger.error(f"Tavily+Groq error: {e}")
-    if API_BASE and API_KEY:
-        news = await get_news_compatible(start, end)
-        if news and len(news) > 100:
-            return news
+            logger.error(f"API compatible parallel error: {e}")
+    # 3. Fallback Tavily only (không AI)
     if TAVILY_API_KEY:
-        return await get_news_tavily_only(start, end)
+        return await get_news_tavily_only_parallel(start, end)
     return f"⚠️ Bot đang bảo trì. Không thể lấy tin cho khung {format_time_range(start, end)}."
 
 # =========================
-# TASK TỰ ĐỘNG THEO MỐC
+# TASK TỰ ĐỘNG THEO MỐC 6 GIỜ
 # =========================
 async def auto_news_scheduler():
     global last_sent_slot
@@ -298,7 +353,7 @@ async def auto_news_scheduler():
                 color=0x00ffcc,
                 timestamp=datetime.utcnow()
             )
-            embed.set_footer(text=f"🤖 Mốc {current_slot}:00 | Nguồn: Tavily+Groq")
+            embed.set_footer(text=f"🤖 Mốc {current_slot}:00 | Nguồn: Đa luồng (Tavily/Groq hoặc API Compatible)")
             try:
                 await channel.send(embed=embed)
                 last_sent_slot = current_slot
@@ -316,9 +371,9 @@ async def get_news(ctx):
         await ctx.send(f"❌ Chỉ hoạt động trong kênh <#{CHANNEL_ID}>")
         return
     async with ctx.typing():
-        msg = await ctx.send("🔍 **Đang quét tin tức 3 giờ gần nhất...**")
+        msg = await ctx.send("🔍 **Đang quét tin tức 6 giờ gần nhất...**")
         now = get_vn_now()
-        start = now - timedelta(hours=3)
+        start = now - timedelta(hours=Config.SEARCH_INTERVAL_HOURS)
         end = now
         digest = await build_digest(start, end)
         if len(digest) > 1900:
@@ -359,9 +414,9 @@ async def bot_status(ctx):
 async def on_ready():
     logger.info(f"✅ Bot online: {bot.user} (ID: {bot.user.id})")
     logger.info(f"Channel: {CHANNEL_ID}")
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Tin theo mốc 3h"))
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Tin theo mốc 6h"))
     bot.loop.create_task(auto_news_scheduler())
-    logger.info("Auto news scheduler started (mốc 0,3,6,9,12,15,18,21 giờ VN)")
+    logger.info("Auto news scheduler started (mốc 0,6,12,18 giờ VN, interval 6h, song song nhiều luồng)")
 
 @bot.event
 async def on_command_error(ctx, error):
