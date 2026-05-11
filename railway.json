@@ -1,4 +1,7 @@
 {
+  "build": {
+    "builder": "DOCKERFILE"
+  },
   "deploy": {
     "startCommand": "python thongtinvacapnhat.py",
     "restartPolicyType": "ON_FAILURE",
