@@ -17,6 +17,7 @@ Fixes applied (from review):
 """
 
 import asyncio
+import importlib
 import hashlib
 import html as html_lib
 import json
@@ -88,23 +89,36 @@ SEARXNG_ENABLED  = bool(SEARXNG_BASE_URL) and os.getenv("SEARXNG_ENABLED", "1").
 
 class Config:
     SEARCH_INTERVAL_HOURS = 12
-    MAX_RETRIES           = int(os.getenv("MAX_RETRIES", "3"))
-    RETRY_DELAY           = float(os.getenv("RETRY_DELAY", "2"))
-    API_RETRY_JITTER      = float(os.getenv("API_RETRY_JITTER", "1.5"))
-    REQUEST_TIMEOUT       = 600
+    MAX_RETRIES           = int(os.getenv("MAX_RETRIES", "3") or 3)
+    RETRY_DELAY           = float(os.getenv("RETRY_DELAY", "1.2") or 1.2)
+    API_RETRY_JITTER      = float(os.getenv("API_RETRY_JITTER", "1.5") or 1.5)
+    RETRY_MAX_DELAY       = float(os.getenv("RETRY_MAX_DELAY", "45") or 45)
+    RETRY_STORM_JITTER    = float(os.getenv("RETRY_STORM_JITTER", "2.5") or 2.5)
+    REQUEST_TIMEOUT       = float(os.getenv("REQUEST_TIMEOUT", "180") or 180)
 
-    MAX_PARALLEL_RESEARCH = int(os.getenv("MAX_PARALLEL_RESEARCH", "40"))
-    MAX_PARALLEL_EDITOR   = int(os.getenv("MAX_PARALLEL_EDITOR", "10"))
-    MAX_PARALLEL_SEARXNG  = int(os.getenv("MAX_PARALLEL_SEARXNG", "10"))
+    API_CONNECT_TIMEOUT   = float(os.getenv("API_CONNECT_TIMEOUT", "15") or 15)
+    API_SOCK_READ_TIMEOUT = float(os.getenv("API_SOCK_READ_TIMEOUT", "180") or 180)
+    SEARCH_TOTAL_TIMEOUT  = float(os.getenv("SEARCH_TOTAL_TIMEOUT", "35") or 35)
+    SEARCH_CONNECT_TIMEOUT = float(os.getenv("SEARCH_CONNECT_TIMEOUT", "8") or 8)
+    SEARCH_SOCK_READ_TIMEOUT = float(os.getenv("SEARCH_SOCK_READ_TIMEOUT", "25") or 25)
+
+    MAX_PARALLEL_RESEARCH = int(os.getenv("MAX_PARALLEL_RESEARCH", "4") or 4)
+    MAX_PARALLEL_EDITOR   = int(os.getenv("MAX_PARALLEL_EDITOR", "4") or 4)
+    MAX_PARALLEL_SEARXNG  = int(os.getenv("MAX_PARALLEL_SEARXNG", "2") or 2)
+    RESEARCH_QUEUE_MAX    = int(os.getenv("RESEARCH_QUEUE_MAX", "24") or 24)
     MAX_PLAIN_TEXT        = 1900
     DISCORD_DELAY         = 0.4
 
     TIMEZONE_OFFSET       = 7
     CACHE_EXPIRE          = 3600
     CACHE_CLEANUP_INTERVAL = 3600
+    SEARCH_QUERY_CACHE_EXPIRE = int(os.getenv("SEARCH_QUERY_CACHE_EXPIRE", "600") or 600)
 
-    TCP_LIMIT             = 100
-    DNS_CACHE             = 300
+    TCP_LIMIT             = int(os.getenv("TCP_LIMIT", "80") or 80)
+    TCP_LIMIT_PER_HOST    = int(os.getenv("TCP_LIMIT_PER_HOST", "12") or 12)
+    TCP_KEEPALIVE         = float(os.getenv("TCP_KEEPALIVE", "45") or 45)
+    TCP_ENABLE_CLEANUP_CLOSED = os.getenv("TCP_ENABLE_CLEANUP_CLOSED", "1").strip().lower() not in {"0", "false", "no", "off"}
+    DNS_CACHE             = int(os.getenv("DNS_CACHE", "300") or 300)
 
     RESEARCH_MAX_TOKENS   = int(os.getenv("RESEARCH_MAX_TOKENS", "1800") or 1800)
     EDITOR_MAX_TOKENS     = int(os.getenv("EDITOR_MAX_TOKENS", "2000") or 2000)
@@ -134,6 +148,14 @@ class Config:
         "SEARXNG_USER_AGENT",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     ).strip()
+    SEARXNG_JSON_FAIL_THRESHOLD = int(os.getenv("SEARXNG_JSON_FAIL_THRESHOLD", "5") or 5)
+    SEARXNG_JSON_COOLDOWN = float(os.getenv("SEARXNG_JSON_COOLDOWN", "300") or 300)
+    SEARXNG_HEALTH_INTERVAL = float(os.getenv("SEARXNG_HEALTH_INTERVAL", "60") or 60)
+    SEARXNG_HEALTH_TIMEOUT = float(os.getenv("SEARXNG_HEALTH_TIMEOUT", "8") or 8)
+    SEARXNG_MIN_DELAY     = float(os.getenv("SEARXNG_MIN_DELAY", "0.15") or 0.15)
+    SEARXNG_MAX_DELAY     = float(os.getenv("SEARXNG_MAX_DELAY", "2.5") or 2.5)
+    HTML_PARSE_MAX_BYTES  = int(os.getenv("HTML_PARSE_MAX_BYTES", "800000") or 800000)
+    LOG_COOLDOWN_SECONDS  = float(os.getenv("LOG_COOLDOWN_SECONDS", "60") or 60)
 
     # Tracking params cần loại bỏ khi normalize URL
     TRACKING_PARAMS = {
@@ -192,22 +214,11 @@ TOPIC_GROUPS: Dict[str, List[str]] = {
         "music industry news",
         "Viet Nam phim giai tri",
     ],
-"⛩️ Seasonal Anime Episodes": [
-    "new anime episodes released today",
-    "seasonal anime airing schedule",
-    "currently airing anime latest episode",
-    "anime episode release calendar Japan",
-    "weekly anime broadcast schedule",
-    "anime simulcast updates Crunchyroll",
-    "anime simulcast updates Netflix",
-    "anime simulcast updates Bilibili",
-    "top seasonal anime this week",
-    "anime next episode release date",
-    "spring summer fall winter anime season",
-    "anime episode countdown",
-    "latest anime episode discussion",
-    "anime trending episodes today",
-    "new anime releases this week"
+    "⛩️ Anime & Manga": [
+        "anime manga news 2026",
+        "One Piece Jujutsu Kaisen",
+        "anime adaptation light novel",
+        "Japanese anime industry",
     ],
     "🏥 Health": [
         "medical breakthrough virus",
@@ -259,6 +270,180 @@ last_processed_key = ""          # mốc cuối đã gửi thành công hoặc �
 scheduler_started  = False
 cache_cleanup_started = False
 searxng_json_blocked = False
+search_query_cache: Dict[str, Dict[str, Any]] = {}
+error_log_state: Dict[str, Dict[str, Any]] = {}
+
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+NO_RETRY_STATUS = {400, 401, 403, 404}
+
+# =========================================================
+# PRODUCTION SEARCH CONTROL
+# =========================================================
+
+class CircuitBreaker:
+    """Circuit breaker nhẹ cho upstream search: CLOSED -> OPEN -> HALF_OPEN."""
+
+    def __init__(self, name: str, fail_threshold: int, cooldown: float) -> None:
+        self.name = name
+        self.fail_threshold = max(1, fail_threshold)
+        self.cooldown = max(1.0, cooldown)
+        self.state = "CLOSED"
+        self.fail_count = 0
+        self.opened_at = 0.0
+        self.last_error = ""
+        self.last_success_at = 0.0
+        self.last_failure_at = 0.0
+        self._lock = asyncio.Lock()
+
+    async def allow(self) -> bool:
+        async with self._lock:
+            if self.state == "OPEN":
+                if time.time() - self.opened_at >= self.cooldown:
+                    self.state = "HALF_OPEN"
+                    return True
+                return False
+            return True
+
+    async def record_success(self) -> None:
+        async with self._lock:
+            old_state = self.state
+            self.state = "CLOSED"
+            self.fail_count = 0
+            self.last_error = ""
+            self.last_success_at = time.time()
+            if old_state != "CLOSED":
+                log_with_cooldown("breaker_recover_" + self.name, logging.INFO, "%s breaker CLOSED", self.name)
+
+    async def record_failure(self, reason: str, hard_open: bool = False) -> None:
+        async with self._lock:
+            self.fail_count += 1
+            self.last_error = reason[:300]
+            self.last_failure_at = time.time()
+            if hard_open or self.fail_count >= self.fail_threshold:
+                if self.state != "OPEN":
+                    self.state = "OPEN"
+                    self.opened_at = time.time()
+                    log_with_cooldown(
+                        "breaker_open_" + self.name,
+                        logging.WARNING,
+                        "%s breaker OPEN %ss after %d fail(s): %s",
+                        self.name,
+                        int(self.cooldown),
+                        self.fail_count,
+                        self.last_error,
+                    )
+
+    async def snapshot(self) -> Dict[str, Any]:
+        async with self._lock:
+            return {
+                "name": self.name,
+                "state": self.state,
+                "fail_count": self.fail_count,
+                "cooldown_left": max(0, int(self.cooldown - (time.time() - self.opened_at))) if self.state == "OPEN" else 0,
+                "last_error": self.last_error,
+            }
+
+
+searxng_json_breaker = CircuitBreaker(
+    "SearXNG JSON",
+    Config.SEARXNG_JSON_FAIL_THRESHOLD,
+    Config.SEARXNG_JSON_COOLDOWN,
+)
+
+
+def log_with_cooldown(key: str, level: int, message: str, *args: Any, cooldown: Optional[float] = None) -> None:
+    """Gộp log lặp để chống spam khi upstream lỗi liên tục."""
+    now = time.time()
+    cooldown = Config.LOG_COOLDOWN_SECONDS if cooldown is None else cooldown
+    state = error_log_state.setdefault(key, {"last": 0.0, "suppressed": 0})
+    elapsed = now - float(state.get("last", 0.0))
+    if elapsed >= cooldown:
+        suppressed = int(state.get("suppressed", 0))
+        suffix = ""
+        if suppressed:
+            suffix = f" | suppressed={suppressed}"
+        logger.log(level, message + suffix, *args)
+        state["last"] = now
+        state["suppressed"] = 0
+    else:
+        state["suppressed"] = int(state.get("suppressed", 0)) + 1
+
+
+def compute_retry_delay(attempt: int, base: Optional[float] = None, retry_after: Optional[str] = None) -> float:
+    """Exponential backoff + jitter + cap + anti retry storm."""
+    if retry_after:
+        try:
+            return min(float(retry_after), Config.RETRY_MAX_DELAY)
+        except Exception:
+            pass
+    base_delay = Config.RETRY_DELAY if base is None else base
+    expo = base_delay * (2 ** max(0, attempt))
+    jitter = random.uniform(0, Config.API_RETRY_JITTER + Config.RETRY_STORM_JITTER)
+    return min(Config.RETRY_MAX_DELAY, expo + jitter)
+
+
+def is_retryable_status(status: int) -> bool:
+    return status in RETRYABLE_STATUS
+
+
+def is_no_retry_status(status: int) -> bool:
+    return status in NO_RETRY_STATUS
+
+
+def api_timeout() -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(
+        total=Config.REQUEST_TIMEOUT,
+        connect=Config.API_CONNECT_TIMEOUT,
+        sock_connect=Config.API_CONNECT_TIMEOUT,
+        sock_read=Config.API_SOCK_READ_TIMEOUT,
+    )
+
+
+def search_timeout(total: Optional[float] = None) -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(
+        total=Config.SEARCH_TOTAL_TIMEOUT if total is None else total,
+        connect=Config.SEARCH_CONNECT_TIMEOUT,
+        sock_connect=Config.SEARCH_CONNECT_TIMEOUT,
+        sock_read=Config.SEARCH_SOCK_READ_TIMEOUT,
+    )
+
+
+def make_tcp_connector(limit: Optional[int] = None, per_host: Optional[int] = None) -> aiohttp.TCPConnector:
+    """Connector dùng pooling, keepalive, DNS cache, cleanup closed sockets."""
+    return aiohttp.TCPConnector(
+        limit=Config.TCP_LIMIT if limit is None else limit,
+        limit_per_host=Config.TCP_LIMIT_PER_HOST if per_host is None else per_host,
+        ttl_dns_cache=Config.DNS_CACHE,
+        keepalive_timeout=Config.TCP_KEEPALIVE,
+        enable_cleanup_closed=Config.TCP_ENABLE_CLEANUP_CLOSED,
+    )
+
+
+def search_cache_key(kind: str, query: str, start: datetime, end: datetime) -> str:
+    raw = f"{kind}:{query.strip().lower()}:{start.isoformat()}:{end.isoformat()}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def get_search_cache(key: str) -> Optional[List[Dict[str, Any]]]:
+    item = search_query_cache.get(key)
+    if not item:
+        return None
+    try:
+        if time.time() - float(item.get("ts", 0)) > Config.SEARCH_QUERY_CACHE_EXPIRE:
+            search_query_cache.pop(key, None)
+            return None
+        data = item.get("data")
+        return data if isinstance(data, list) else None
+    except Exception:
+        search_query_cache.pop(key, None)
+        return None
+
+
+def set_search_cache(key: str, data: List[Dict[str, Any]]) -> None:
+    search_query_cache[key] = {"ts": time.time(), "data": merge_unique_articles(data)}
+    if len(search_query_cache) > 500:
+        for old_key in sorted(search_query_cache, key=lambda k: search_query_cache[k].get("ts", 0))[:100]:
+            search_query_cache.pop(old_key, None)
 
 # =========================================================
 # TIME HELPERS
@@ -626,9 +811,10 @@ async def _api_call(
     messages: List[Dict[str, str]],
     max_tokens: int,
 ) -> Optional[Dict[str, Any]]:
-    """Iterative retry với exponential backoff — không đệ quy."""
+    """Iterative retry: chỉ retry 429/5xx + timeout/network; 401/403/404 không retry."""
     for attempt in range(Config.MAX_RETRIES + 1):
         try:
+            started = time.perf_counter()
             async with session.post(
                 f"{api_base}/chat/completions",
                 headers={
@@ -642,47 +828,73 @@ async def _api_call(
                     "max_tokens":  max_tokens,
                     "stream":      False,
                 },
-                timeout=aiohttp.ClientTimeout(
-                    total=Config.REQUEST_TIMEOUT,
-                    sock_read=Config.REQUEST_TIMEOUT,
-                ),
+                timeout=api_timeout(),
             ) as resp:
-                if resp.status in {429, 500, 502, 503, 504}:
+                latency_ms = (time.perf_counter() - started) * 1000
+                if is_retryable_status(resp.status):
                     body = (await resp.text())[:300]
                     if attempt < Config.MAX_RETRIES:
-                        delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
-                        logger.warning(
-                            "Retry API model=%s %s/%s sau %.1fs (HTTP %s): %s",
-                            model, attempt + 1, Config.MAX_RETRIES, delay, resp.status, body,
+                        delay = compute_retry_delay(attempt, retry_after=resp.headers.get("Retry-After"))
+                        log_with_cooldown(
+                            f"api_retry_{model}_{resp.status}",
+                            logging.WARNING,
+                            "API retry model=%s attempt=%s/%s delay=%.1fs status=%s latency=%.0fms body=%s",
+                            model, attempt + 1, Config.MAX_RETRIES, delay, resp.status, latency_ms, body,
                         )
                         await asyncio.sleep(delay)
                         continue
-                    logger.error("Het retry API model=%s (HTTP %s): %s", model, resp.status, body)
+                    log_with_cooldown(
+                        f"api_retry_exhausted_{model}_{resp.status}",
+                        logging.ERROR,
+                        "API exhausted model=%s status=%s latency=%.0fms body=%s",
+                        model, resp.status, latency_ms, body,
+                    )
                     return None
 
                 if resp.status != 200:
-                    logger.error("API model=%s %s: %s", model, resp.status, await resp.text())
+                    body = (await resp.text())[:500]
+                    level = logging.ERROR if is_no_retry_status(resp.status) else logging.WARNING
+                    log_with_cooldown(
+                        f"api_no_retry_{model}_{resp.status}",
+                        level,
+                        "API no-retry model=%s status=%s latency=%.0fms body=%s",
+                        model, resp.status, latency_ms, body,
+                    )
                     return None
 
                 return await parse_openai_response(resp)
 
+        except asyncio.CancelledError:
+            raise
         except asyncio.TimeoutError:
             if attempt < Config.MAX_RETRIES:
-                delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
-                logger.warning("Timeout retry model=%s %s/%s sau %.1fs", model, attempt + 1, Config.MAX_RETRIES, delay)
+                delay = compute_retry_delay(attempt)
+                log_with_cooldown(
+                    f"api_timeout_{model}",
+                    logging.WARNING,
+                    "API timeout retry model=%s attempt=%s/%s delay=%.1fs",
+                    model, attempt + 1, Config.MAX_RETRIES, delay,
+                )
                 await asyncio.sleep(delay)
-            else:
-                logger.error("Het retry do timeout")
-                return None
-
-        except Exception as e:
+                continue
+            log_with_cooldown(f"api_timeout_exhausted_{model}", logging.ERROR, "API timeout exhausted model=%s", model)
+            return None
+        except aiohttp.ClientError as e:
             if attempt < Config.MAX_RETRIES:
-                delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
-                logger.warning("Loi API retry model=%s %s/%s: %s", model, attempt + 1, Config.MAX_RETRIES, e)
+                delay = compute_retry_delay(attempt)
+                log_with_cooldown(
+                    f"api_client_{model}_{type(e).__name__}",
+                    logging.WARNING,
+                    "API client retry model=%s attempt=%s/%s delay=%.1fs error=%s",
+                    model, attempt + 1, Config.MAX_RETRIES, delay, str(e)[:200],
+                )
                 await asyncio.sleep(delay)
-            else:
-                logger.error("Het retry: %s", e)
-                return None
+                continue
+            log_with_cooldown(f"api_client_exhausted_{model}", logging.ERROR, "API client exhausted model=%s error=%s", model, str(e)[:300])
+            return None
+        except Exception as e:
+            log_with_cooldown(f"api_unexpected_{model}", logging.ERROR, "API unexpected model=%s error=%s", model, str(e)[:300])
+            return None
 
     return None
 
@@ -886,6 +1098,12 @@ async def compatible_web_search_query(
     if not WEB_SEARCH_ENABLED:
         return None
 
+    cache_key = search_cache_key("web", clean_query, start, end)
+    cached = get_search_cache(cache_key)
+    if cached is not None:
+        logger.info("Web search cache hit: %s -> %d ket qua", clean_query, len(cached))
+        return cached
+
     payload = {
         "model": WEB_SEARCH_MODEL,
         "query": clean_query,
@@ -900,36 +1118,72 @@ async def compatible_web_search_query(
 
     for attempt in range(Config.MAX_RETRIES + 1):
         try:
+            started = time.perf_counter()
             async with session.post(
                 web_search_url(),
                 headers=headers,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT),
+                timeout=search_timeout(),
             ) as resp:
                 body = await resp.text()
-                if resp.status in {429, 500, 502, 503, 504} and attempt < Config.MAX_RETRIES:
-                    delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
-                    logger.warning("Web search retry %s/%s sau %.1fs (HTTP %s)", attempt + 1, Config.MAX_RETRIES, delay, resp.status)
-                    await asyncio.sleep(delay)
-                    continue
+                latency_ms = (time.perf_counter() - started) * 1000
+                if is_retryable_status(resp.status):
+                    if attempt < Config.MAX_RETRIES:
+                        delay = compute_retry_delay(attempt, retry_after=resp.headers.get("Retry-After"))
+                        log_with_cooldown(
+                            f"web_search_retry_{resp.status}",
+                            logging.WARNING,
+                            "Web search retry query=%s attempt=%s/%s delay=%.1fs status=%s latency=%.0fms body=%s",
+                            clean_query, attempt + 1, Config.MAX_RETRIES, delay, resp.status, latency_ms, body[:200],
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    log_with_cooldown(
+                        f"web_search_exhausted_{resp.status}",
+                        logging.ERROR,
+                        "Web search exhausted query=%s status=%s latency=%.0fms body=%s",
+                        clean_query, resp.status, latency_ms, body[:300],
+                    )
+                    return None
                 if resp.status != 200:
-                    logger.error("Web search API %s: %s", resp.status, body[:300])
+                    level = logging.WARNING if is_no_retry_status(resp.status) else logging.ERROR
+                    log_with_cooldown(
+                        f"web_search_no_retry_{resp.status}",
+                        level,
+                        "Web search no-retry query=%s status=%s latency=%.0fms body=%s",
+                        clean_query, resp.status, latency_ms, body[:300],
+                    )
                     return None
                 try:
                     data = json.loads(body)
                 except Exception:
-                    data = await resp.json(content_type=None)
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception as e:
+                        log_with_cooldown("web_search_json_malformed", logging.WARNING, "Web search JSON malformed query=%s error=%s", clean_query, str(e)[:200])
+                        return None
                 articles = web_search_articles_from_payload(data, clean_query, group, topic, start, end)
-                logger.info("Web search tool: %s -> %d ket qua", clean_query, len(articles))
+                set_search_cache(cache_key, articles)
+                logger.info("Web search tool: %s -> %d ket qua latency=%.0fms", clean_query, len(articles), latency_ms)
                 return articles
-        except Exception as e:
+        except asyncio.CancelledError:
+            raise
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             if attempt < Config.MAX_RETRIES:
-                delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
-                logger.warning("Web search loi retry %s/%s: %s", attempt + 1, Config.MAX_RETRIES, e)
+                delay = compute_retry_delay(attempt)
+                log_with_cooldown(
+                    f"web_search_exc_{type(e).__name__}",
+                    logging.WARNING,
+                    "Web search retry query=%s attempt=%s/%s delay=%.1fs error=%s",
+                    clean_query, attempt + 1, Config.MAX_RETRIES, delay, str(e)[:200],
+                )
                 await asyncio.sleep(delay)
-            else:
-                logger.error("Web search het retry: %s", e)
-                return None
+                continue
+            log_with_cooldown("web_search_exc_exhausted", logging.ERROR, "Web search exhausted query=%s error=%s", clean_query, str(e)[:300])
+            return None
+        except Exception as e:
+            log_with_cooldown("web_search_unexpected", logging.ERROR, "Web search unexpected query=%s error=%s", clean_query, str(e)[:300])
+            return None
 
     return None
 
@@ -939,14 +1193,44 @@ def searxng_headers(kind: str = "json") -> Dict[str, str]:
     return {
         "Accept": accept,
         "Accept-Language": "vi,en-US;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
         "User-Agent": Config.SEARXNG_USER_AGENT,
     }
 
 
 def strip_html_fragment(value: str) -> str:
-    value = re.sub(r"(?is)<(script|style).*?</\1>", " ", value)
+    value = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", value)
     value = re.sub(r"(?is)<[^>]+>", " ", value)
     return re.sub(r"\s+", " ", html_lib.unescape(value)).strip()
+
+
+def searxng_json_params(query: str) -> Dict[str, str]:
+    return {
+        "q": query,
+        "format": "json",
+        "categories": Config.SEARXNG_CATEGORIES,
+        "language": Config.SEARXNG_LANGUAGE,
+        "time_range": Config.SEARXNG_TIME_RANGE,
+        "safesearch": "0",
+    }
+
+
+def searxng_html_params(query: str) -> Dict[str, str]:
+    return {
+        "q": query,
+        "categories": Config.SEARXNG_CATEGORIES,
+        "language": Config.SEARXNG_LANGUAGE,
+        "time_range": Config.SEARXNG_TIME_RANGE,
+        "safesearch": "0",
+    }
+
+
+def normalize_article_output(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    for art in articles:
+        if isinstance(art, dict) and art.get("url"):
+            art["url"] = _normalize_url(str(art["url"]))
+    return merge_unique_articles(articles)
 
 
 def resolve_searxng_href(href: str) -> str:
@@ -976,7 +1260,10 @@ def searxng_articles_from_json(
     end: datetime,
 ) -> List[Dict[str, Any]]:
     articles: List[Dict[str, Any]] = []
-    for item in data.get("results", [])[:Config.SEARXNG_MAX_RESULTS]:
+    items = data.get("results", []) if isinstance(data, dict) else []
+    if not isinstance(items, list):
+        return []
+    for item in items[:Config.SEARXNG_MAX_RESULTS]:
         if not isinstance(item, dict):
             continue
         title = str(item.get("title", "")).strip()
@@ -1001,11 +1288,12 @@ def searxng_articles_from_json(
             "published_at": str(published or "").strip(),
             "search_query": clean_query,
             "time_window": format_range(start, end),
+            "parser_mode": "json",
             "_group": group,
         }
         if valid_article(art) and url:
             articles.append(art)
-    return articles
+    return normalize_article_output(articles)
 
 
 def parse_searxng_html_results(
