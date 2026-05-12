@@ -260,11 +260,15 @@ def format_range(start: datetime, end: datetime) -> str:
     return f"{start.strftime('%H:%M %d/%m/%Y')} -> {end.strftime('%H:%M %d/%m/%Y')}"
 
 def slot_for(dt: datetime) -> int:
-    """Tính slot từ chính dt, không dùng clock hiện tại."""
+    """Tính slot gần nhất <= giờ hiện tại; nếu trước slot đầu, lấy slot cuối hôm trước."""
     hour = dt.hour
-    for slot in reversed(Config.SLOTS):
-        if hour >= slot:
-            return slot
+    best = None
+    for slot in Config.SLOTS:
+        if slot <= hour:
+            if best is None or slot > best:
+                best = slot
+    if best is not None:
+        return best
     return Config.SLOTS[-1]
 
 def current_slot() -> int:
@@ -273,6 +277,8 @@ def current_slot() -> int:
 def slot_start_time(dt: Optional[datetime] = None) -> datetime:
     dt = dt or vn_now()
     slot = slot_for(dt)
+    if slot > dt.hour:
+        dt = dt - timedelta(days=1)
     return dt.replace(hour=slot, minute=0, second=0, microsecond=0)
 
 def slot_key(dt: Optional[datetime] = None) -> str:
