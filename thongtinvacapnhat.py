@@ -646,6 +646,15 @@ def source_from_url(url: str) -> str:
     except Exception:
         return "Tavily"
 
+
+def compact_markdown_link(url: str, label: str = "Đọc bài viết") -> str:
+    """Tạo link chữ xanh bấm được, không hiện URL dài."""
+    clean_url = url.strip().strip("<>").rstrip(".,;:!?)]}”’»")
+    if not clean_url:
+        return ""
+    source = source_from_url(clean_url)
+    return f"[{label} - {source}]({clean_url})"
+
 def importance_from_score(score: Any) -> int:
     try:
         value = float(score)
@@ -1043,22 +1052,25 @@ def split_message(text: str, max_len: int = Config.MAX_PLAIN_TEXT) -> List[str]:
 # Python render từ JSON — không để AI tự viết markdown Discord
 # =========================================================
 
-TAG_EMOJI: Dict[str, str] = {
-    "viral":      "🔥",
-    "ai":         "🤖",
-    "canh bao":   "⚠️",
-    "moi":        "🚀",
-    "game":       "🎮",
-    "tai chinh":  "💰",
-    "the gioi":   "🌏",
-    "viet nam":   "🇻🇳",
-    "suc khoe":   "🏥",
-    "phim":       "🎬",
-}
+DISPLAY_ICON_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002700-\U000027BF"
+    "\U00002600-\U000026FF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def clean_display_label(value: Any) -> str:
+    """Bỏ emoji/icon trang trí khỏi text hiển thị Discord."""
+    text = DISPLAY_ICON_RE.sub("", safe_text(value))
+    return re.sub(r"\s{2,}", " ", text).strip(" -|•")
+
 
 def render_tag(tag: str) -> str:
-    emoji = TAG_EMOJI.get(tag.strip().lower(), "🏷️")
-    return f"{emoji} {safe_text(tag)}"
+    return clean_display_label(tag)
+
 
 def render_article(art: Dict[str, Any], rank: int) -> str:
     title   = safe_text(art.get("title",   "Khong co tieu de"))
@@ -1068,23 +1080,21 @@ def render_article(art: Dict[str, Any], rank: int) -> str:
     score   = art.get("final_score", 0)
     tags    = art.get("tags", [])
 
-    medals  = {1: "🥇", 2: "🥈", 3: "🥉"}
-    medal   = medals.get(rank, f"#{rank}")
-
-    lines = [f"{medal} **{title}**"]
-    if tags:
-        lines.append("  ".join(render_tag(t) for t in tags))
+    lines = [f"**{rank}. {title}**"]
+    clean_tags = [render_tag(t) for t in tags if str(t).strip()]
+    if clean_tags:
+        lines.append(f"Phân loại: {', '.join(clean_tags[:3])}")
     if summary:
         lines.append(summary)
     meta = []
     if source:
-        meta.append(f"📰 _{source}_")
+        meta.append(f"Nguồn: _{source}_")
     if score:
-        meta.append(f"🎯 {int(score)}pt")
+        meta.append(f"Điểm: {int(score)}")
     if meta:
-        lines.append("  •  ".join(meta))
+        lines.append(" • ".join(meta))
     if url:
-        lines.append(f"🔗 {url}")
+        lines.append(compact_markdown_link(url))
 
     return "\n".join(lines)
 
@@ -1100,10 +1110,10 @@ async def send_ranked_digest(
     if not judged:
         await channel.send(
             embed=discord.Embed(
-                title="📰 TECH DIGEST",
+                title="Tin mới",
                 description=(
-                    f"🕐 **{format_range(start, end)}**\n"
-                    "⚠️ Khong tim thay tin moi trong khung thoi gian nay."
+                    f"**{format_range(start, end)}**\n"
+                    "Khong tim thay tin moi trong khung thoi gian nay."
                 ),
                 color=0xAAAAAA,
                 timestamp=datetime.now(timezone.utc),
@@ -1118,18 +1128,17 @@ async def send_ranked_digest(
     n_arts    = sum(len(v) for v in groups.values() if isinstance(v, list))
 
     header = discord.Embed(
-        title="📰 TECH DIGEST",
+        title="Tin mới tổng hợp",
         description=(
-            f"🕐 **{format_range(start, end)}**\n"
-            f"📂 **{n_groups} nhom**  •  📄 **{n_arts} tin chon loc**\n"
-            + (f"\n✨ _{highlight}_\n" if highlight else "")
-            + "━" * 26
+            f"**{format_range(start, end)}**\n"
+            f"{n_groups} nhóm • {n_arts} tin chọn lọc"
+            + (f"\n\n_{highlight}_" if highlight else "")
         ),
-        color=0x00FFCC,
+        color=0x2F80ED,
         timestamp=datetime.now(timezone.utc),
     )
     header.set_footer(
-        text=f"🤖 Multi-Agent | {total_topics} topics | 6h | Anti-dup ON"
+        text=f"Multi-Agent | {total_topics} topics | 6h | Anti-dup ON"
     )
     await channel.send(embed=header, allowed_mentions=NO_MENTIONS)
     await asyncio.sleep(0.8)
@@ -1140,7 +1149,7 @@ async def send_ranked_digest(
 
         await channel.send(
             embed=discord.Embed(
-                title=safe_text(group_name),
+                title=clean_display_label(group_name) or "Tin mới",
                 color=GROUP_COLORS.get(group_name, 0xAAAAAA),
             ),
             allowed_mentions=NO_MENTIONS,
@@ -1150,7 +1159,11 @@ async def send_ranked_digest(
         full_text = "\n\n".join(rendered)
 
         for chunk in split_message(full_text):
-            await channel.send(chunk, allowed_mentions=NO_MENTIONS)
+            await channel.send(
+                chunk,
+                allowed_mentions=NO_MENTIONS,
+                suppress_embeds=True,
+            )
             await asyncio.sleep(Config.DISCORD_DELAY)
 
         await asyncio.sleep(0.5)
