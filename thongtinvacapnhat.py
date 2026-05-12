@@ -216,7 +216,7 @@ TOPIC_GROUPS: Dict[str, List[str]] = {
     ],
     "⛩️ Anime & Manga": [
         "anime manga news 2026",
-        "One Piece Jujutsu Kaisen",
+        "cac bo anime moi trong mua nay, cac tap anime của cac bo vao hom nay",
         "anime adaptation light novel",
         "Japanese anime industry",
     ],
