@@ -65,10 +65,14 @@ EDITOR_API_BASE   = os.getenv("EDITOR_API_BASE",  RESEARCH_API_BASE).rstrip("/")
 EDITOR_API_KEY    = os.getenv("EDITOR_API_KEY",   RESEARCH_API_KEY).strip()
 EDITOR_MODEL      = os.getenv("EDITOR_MODEL",     RESEARCH_MODEL).strip()
 
-# Tavily — Web Search API cho AI Agent (primary research nếu có key)
+# Tavily — legacy backend, khong con nam trong flow chinh Agent 1
 TAVILY_API_KEY   = os.getenv("TAVILY_API_KEY", "").strip()
 TAVILY_API_BASE  = os.getenv("TAVILY_API_BASE", "https://api.tavily.com").rstrip("/")
 TAVILY_ENABLED   = bool(TAVILY_API_KEY) and os.getenv("TAVILY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+# SearXNG — tool search do Agent 1 truc tiep goi
+SEARXNG_BASE_URL = os.getenv("SEARXNG_BASE_URL", "").rstrip("/")
+SEARXNG_ENABLED  = bool(SEARXNG_BASE_URL) and os.getenv("SEARXNG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 # =========================================================
 # CONFIG
@@ -80,8 +84,8 @@ class Config:
     RETRY_DELAY           = 2
     REQUEST_TIMEOUT       = 600
 
-    MAX_PARALLEL_RESEARCH = 35
-    MAX_PARALLEL_EDITOR   = 8
+    MAX_PARALLEL_RESEARCH = 50
+    MAX_PARALLEL_EDITOR   = 15
     MAX_PLAIN_TEXT        = 1900
     DISCORD_DELAY         = 0.4
 
@@ -92,8 +96,9 @@ class Config:
     TCP_LIMIT             = 100
     DNS_CACHE             = 300
 
-    RESEARCH_MAX_TOKENS   = 1200
-    EDITOR_MAX_TOKENS     = 2000
+    RESEARCH_MAX_TOKENS   = int(os.getenv("RESEARCH_MAX_TOKENS", "1800") or 1800)
+    EDITOR_MAX_TOKENS     = int(os.getenv("EDITOR_MAX_TOKENS", "2000") or 2000)
+    RESEARCH_TOOL_MAX_STEPS = int(os.getenv("RESEARCH_TOOL_MAX_STEPS", "4") or 4)
 
     STATE_FILE            = "bot_state.json"
     SENT_URLS_FILE        = "sent_urls.json"
@@ -106,6 +111,11 @@ class Config:
 
     TAVILY_MAX_RESULTS    = int(os.getenv("TAVILY_MAX_RESULTS", "4") or 4)
     TAVILY_SEARCH_DEPTH   = os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip() or "basic"
+
+    SEARXNG_MAX_RESULTS   = int(os.getenv("SEARXNG_MAX_RESULTS", "5") or 5)
+    SEARXNG_CATEGORIES    = os.getenv("SEARXNG_CATEGORIES", "news,general").strip() or "news,general"
+    SEARXNG_LANGUAGE      = os.getenv("SEARXNG_LANGUAGE", "all").strip() or "all"
+    SEARXNG_TIME_RANGE    = os.getenv("SEARXNG_TIME_RANGE", "day").strip() or "day"
 
     # Tracking params cần loại bỏ khi normalize URL
     TRACKING_PARAMS = {
@@ -639,7 +649,7 @@ async def _api_call(
     return None
 
 # =========================================================
-# TAVILY SEARCH
+# SEARCH TOOLS / LEGACY BACKENDS: TAVILY + SEARXNG
 # =========================================================
 
 def source_from_url(url: str) -> str:
@@ -748,31 +758,293 @@ async def tavily_search_topic(
     logger.info("Tavily: %s -> %d ket qua", topic, len(articles))
     return articles
 
+
+async def searxng_search_query(
+    session: aiohttp.ClientSession,
+    query: str,
+    group: str,
+    topic: str,
+    start: datetime,
+    end: datetime,
+) -> Optional[List[Dict[str, Any]]]:
+    """Tool SearXNG: Agent 1 tu sinh query, backend chi thuc thi tool call."""
+    if not SEARXNG_ENABLED:
+        return None
+
+    clean_query = re.sub(r"\s+", " ", query).strip()[:300]
+    if not clean_query:
+        return []
+
+    params = {
+        "q": clean_query,
+        "format": "json",
+        "categories": Config.SEARXNG_CATEGORIES,
+        "language": Config.SEARXNG_LANGUAGE,
+        "time_range": Config.SEARXNG_TIME_RANGE,
+        "safesearch": "0",
+    }
+    headers = {"Accept": "application/json"}
+
+    data: Optional[Dict[str, Any]] = None
+    for attempt in range(Config.MAX_RETRIES + 1):
+        try:
+            async with session.get(
+                f"{SEARXNG_BASE_URL}/search",
+                params=params,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT),
+            ) as resp:
+                if resp.status in {429, 500, 502, 503, 504} and attempt < Config.MAX_RETRIES:
+                    delay = Config.RETRY_DELAY * (2 ** attempt)
+                    logger.warning("SearXNG tool retry %s/%s sau %.1fs (HTTP %s)", attempt + 1, Config.MAX_RETRIES, delay, resp.status)
+                    await asyncio.sleep(delay)
+                    continue
+                if resp.status != 200:
+                    logger.error("SearXNG tool API %s: %s", resp.status, (await resp.text())[:300])
+                    return None
+                data = await resp.json(content_type=None)
+                break
+        except Exception as e:
+            if attempt < Config.MAX_RETRIES:
+                delay = Config.RETRY_DELAY * (2 ** attempt)
+                logger.warning("SearXNG tool loi retry %s/%s: %s", attempt + 1, Config.MAX_RETRIES, e)
+                await asyncio.sleep(delay)
+            else:
+                logger.error("SearXNG tool het retry: %s", e)
+                return None
+
+    if not isinstance(data, dict):
+        return None
+
+    articles: List[Dict[str, Any]] = []
+    for item in data.get("results", [])[:Config.SEARXNG_MAX_RESULTS]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        url = str(item.get("url", "")).strip()
+        summary = str(
+            item.get("content")
+            or item.get("snippet")
+            or item.get("description")
+            or title
+        ).strip()
+        published = item.get("publishedDate") or item.get("published_date") or item.get("published")
+        if published:
+            summary = f"{summary}\nNgay dang: {published}".strip()
+        source = str(item.get("source") or item.get("engine") or source_from_url(url)).strip()
+        art = {
+            "title": title,
+            "summary": summary,
+            "url": url,
+            "source": source,
+            "topic": topic,
+            "importance": importance_from_score(item.get("score", 0.5)),
+            "published_at": str(published or "").strip(),
+            "search_query": clean_query,
+            "time_window": format_range(start, end),
+            "_group": group,
+        }
+        if valid_article(art) and url:
+            articles.append(art)
+
+    logger.info("SearXNG tool: %s -> %d ket qua", clean_query, len(articles))
+    return articles
+
+
+async def searxng_search_topic(
+    session: aiohttp.ClientSession,
+    topic: str,
+    group: str,
+    start: datetime,
+    end: datetime,
+) -> Optional[List[Dict[str, Any]]]:
+    """Legacy wrapper. Flow chinh khong goi truc tiep ham nay nua."""
+    query = f"{topic} latest news {end.strftime('%Y-%m-%d')}"
+    return await searxng_search_query(session, query, group, topic, start, end)
+
+
+def merge_unique_articles(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    for art in articles:
+        if not valid_article(art):
+            continue
+        key = art.get("url") or art.get("title") or str(art)
+        h = _url_hash(str(key))
+        if h in seen:
+            continue
+        seen.add(h)
+        merged.append(art)
+    return merged
+
+
+async def search_topic_backends(
+    session: aiohttp.ClientSession,
+    topic: str,
+    group: str,
+    start: datetime,
+    end: datetime,
+) -> Optional[List[Dict[str, Any]]]:
+    tasks = []
+    names = []
+
+    if TAVILY_ENABLED:
+        tasks.append(tavily_search_topic(session, topic, group, start, end))
+        names.append("Tavily")
+    if SEARXNG_ENABLED:
+        tasks.append(searxng_search_topic(session, topic, group, start, end))
+        names.append("SearXNG")
+
+    if not tasks:
+        return None
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    articles: List[Dict[str, Any]] = []
+
+    for name, result in zip(names, results):
+        if isinstance(result, Exception):
+            logger.error("%s search loi topic=%s: %s", name, topic, result)
+            continue
+        if isinstance(result, list):
+            articles.extend(result)
+
+    return merge_unique_articles(articles)
+
 # =========================================================
 # AGENT 1 — RESEARCHER
 # =========================================================
 
-RESEARCHER_SYSTEM = """Ban la AI chuyen thu thap tin tuc.
+RESEARCHER_SYSTEM = """Ban la Agent 1: autonomous research agent co quyen dung tool SearXNG.
 
-Nhiem vu:
-- Doc yeu cau chu de va khung thoi gian
-- Tim 2-4 tin MOI NHAT, noi bat nhat
-- Output CHI la JSON array, khong co markdown, khong co text thua
+Kien truc bat buoc:
+- RESEARCH_MODEL la core reasoning model cua Agent 1, khong phai fallback.
+- Backend khong tu search truoc. Backend chi thuc thi tool call khi ban yeu cau.
+- Ban phai tu quyet dinh query, tu search, retry/refine query, gom ket qua, loc duplicate, danh gia nguon, tom tat, chuan hoa package.
+- Chi lay tin nam trong rolling 12-hour window nguoi dung cung cap.
+- Khong bia dat URL. Chi dung URL da xuat hien trong observation cua tool.
+- Neu chua co observation hoac ket qua yeu, hay goi tool search truoc khi final.
 
-Format JSON bat buoc:
-[
-  {
-    "title": "Tieu de tin (tieng Viet)",
-    "summary": "Tom tat 2 cau ngan gon bang tieng Viet.",
-    "url": "https://...",
-    "source": "Ten nguon bao",
-    "topic": "Ten chu de",
-    "importance": 75
-  }
-]
+Tool co san:
+- searxng_search(query): tim web/news qua SearXNG.
 
-importance: 0-100, danh gia so bo muc do quan trong.
-Neu khong co tin phu hop, tra ve: []"""
+Moi response CHI la JSON object, khong markdown, khong text thua.
+
+De goi tool:
+{
+  "action": "search",
+  "query": "query search cu the",
+  "reason": "ly do ngan gon"
+}
+
+De ket thuc:
+{
+  "action": "final",
+  "articles": [
+    {
+      "title": "Tieu de tin bang tieng Viet",
+      "summary": "Tom tat 2 cau ngan gon bang tieng Viet, neu ro y nghia tin.",
+      "url": "https://...",
+      "source": "Ten nguon",
+      "topic": "Chu de goc",
+      "importance": 75,
+      "source_quality": "high|medium|low",
+      "why_important": "Ly do dang theo doi",
+      "published_at": "neu co"
+    }
+  ]
+}
+
+Quy tac final:
+- Chon 0-4 bai moi, noi bat, lien quan nhat.
+- Deduplicate theo URL va noi dung.
+- Uu tien nguon goc/bao lon/nguon chinh thuc.
+- importance tu 0 den 100.
+- Neu khong co tin phu hop khung gio: {"action":"final","articles":[]}."""
+
+
+def parse_research_action(raw: str) -> Optional[Dict[str, Any]]:
+    """Doc lenh JSON cua Agent 1. Chap nhan object moi, fallback array cu."""
+    obj = extract_json_object(raw)
+    if isinstance(obj, dict):
+        if isinstance(obj.get("articles"), list) and not obj.get("action"):
+            obj["action"] = "final"
+        return obj
+
+    arr = extract_json_array(raw)
+    if isinstance(arr, list):
+        return {"action": "final", "articles": arr}
+
+    return None
+
+
+def compact_tool_observations(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rut gon output tool de dua lai cho Agent 1, tranh phinh context."""
+    compact: List[Dict[str, Any]] = []
+    for art in articles[:Config.SEARXNG_MAX_RESULTS]:
+        compact.append(
+            {
+                "title": str(art.get("title", ""))[:220],
+                "summary": str(art.get("summary", ""))[:500],
+                "url": str(art.get("url", "")),
+                "source": str(art.get("source", "")),
+                "published_at": str(art.get("published_at", "")),
+                "search_query": str(art.get("search_query", ""))[:220],
+            }
+        )
+    return compact
+
+
+def validate_research_package(
+    articles: Any,
+    group: str,
+    topic: str,
+    observed_articles: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Validate package Agent 1; chi nhan URL da thay tu SearXNG tool."""
+    if not isinstance(articles, list):
+        return []
+
+    observed_by_url: Dict[str, Dict[str, Any]] = {}
+    for art in observed_articles:
+        if not isinstance(art, dict):
+            continue
+        url = str(art.get("url", "")).strip()
+        if url:
+            observed_by_url[_normalize_url(url)] = art
+
+    valid: List[Dict[str, Any]] = []
+    seen = set()
+    for item in articles:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "")).strip()
+        if not url:
+            continue
+        key = _normalize_url(url)
+        observed = observed_by_url.get(key)
+        if not observed or _url_hash(url) in seen:
+            continue
+
+        title = str(item.get("title") or observed.get("title") or "").strip()
+        summary = str(item.get("summary") or observed.get("summary") or "").strip()
+        source = str(item.get("source") or observed.get("source") or source_from_url(url)).strip()
+        research_item: Dict[str, Any] = {
+            "title": title,
+            "summary": summary,
+            "url": url,
+            "source": source,
+            "topic": str(item.get("topic") or topic).strip(),
+            "importance": importance_from_score(item.get("importance", observed.get("importance", 50))),
+            "source_quality": str(item.get("source_quality", "medium")).strip() or "medium",
+            "why_important": str(item.get("why_important", "")).strip(),
+            "published_at": str(item.get("published_at") or observed.get("published_at") or "").strip(),
+            "_group": group,
+        }
+        if valid_article(research_item):
+            seen.add(_url_hash(url))
+            valid.append(research_item)
+
+    return valid[:4]
 
 
 async def research_topic(
@@ -782,8 +1054,8 @@ async def research_topic(
     start: datetime,
     end: datetime,
 ) -> List[Dict[str, Any]]:
-    """Agent 1: search 1 topic → list bài thô (JSON validated)."""
-    cache_key = make_cache_key(f"research_{topic}", start, end)
+    """Agent 1: autonomous tool-using researcher → structured research package."""
+    cache_key = make_cache_key(f"research_agent1_{topic}", start, end)
     cached    = get_cache(cache_key)
     if cached:
         try:
@@ -793,56 +1065,142 @@ async def research_topic(
         except Exception as e:
             logger.warning("Cache research bi hong topic=%s: %s", topic, e)
 
+    if not RESEARCH_API_BASE or not RESEARCH_API_KEY or not RESEARCH_MODEL:
+        logger.error("Agent 1 thieu RESEARCH_API_BASE/RESEARCH_API_KEY/RESEARCH_MODEL")
+        return []
+    if not SEARXNG_ENABLED:
+        logger.error("Agent 1 can SearXNG tool nhung SEARXNG chua bat")
+        return []
+
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": RESEARCHER_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"Chu de: {topic}\n"
+                f"Nhom: {group}\n"
+                f"Rolling 12-hour window gio VN: {format_range(start, end)}\n"
+                f"Ngay ket thuc: {end.strftime('%Y-%m-%d')}\n"
+                "Hay tu lap query va dung tool searxng_search. "
+                "Sau khi co observation, refine/retry neu can, roi final structured research package."
+            ),
+        },
+    ]
+    observed_articles: List[Dict[str, Any]] = []
+    searched_queries = set()
+
     async with research_semaphore:
-        tavily_articles = await tavily_search_topic(session, topic, group, start, end)
-        if tavily_articles is not None:
-            if tavily_articles:
-                set_cache(cache_key, json.dumps(tavily_articles, ensure_ascii=False))
-            return tavily_articles
+        for step in range(Config.RESEARCH_TOOL_MAX_STEPS):
+            result = await _api_call(
+                session,
+                RESEARCH_API_BASE,
+                RESEARCH_API_KEY,
+                RESEARCH_MODEL,
+                messages=messages,
+                max_tokens=Config.RESEARCH_MAX_TOKENS,
+            )
+            if not result:
+                return []
 
-        if not RESEARCH_API_BASE or not RESEARCH_API_KEY:
-            logger.warning("Bo qua researcher fallback vi thieu RESEARCH_API_BASE/RESEARCH_API_KEY")
-            return []
+            raw = result["choices"][0]["message"].get("content", "")
+            messages.append({"role": "assistant", "content": raw})
+            action = parse_research_action(raw)
+            if not isinstance(action, dict):
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "JSON khong hop le. Hay tra ve object action=search hoac action=final dung schema.",
+                    }
+                )
+                continue
 
-        result = await _api_call(
-            session,
-            RESEARCH_API_BASE,
-            RESEARCH_API_KEY,
-            RESEARCH_MODEL,
-            messages=[
-                {"role": "system", "content": RESEARCHER_SYSTEM},
+            action_name = str(action.get("action", "")).strip().lower()
+            if action_name == "search":
+                query = re.sub(r"\s+", " ", str(action.get("query", "")).strip())[:300]
+                if not query:
+                    messages.append({"role": "user", "content": "Query rong. Hay tao query search cu the hon."})
+                    continue
+                if query.lower() in searched_queries:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": f"Query da search roi: {query}. Hay refine query khac hoac final neu du du lieu.",
+                        }
+                    )
+                    continue
+
+                searched_queries.add(query.lower())
+                tool_articles = await searxng_search_query(session, query, group, topic, start, end)
+                if isinstance(tool_articles, list):
+                    observed_articles.extend(tool_articles)
+                    observed_articles = merge_unique_articles(observed_articles)
+                    observation = {
+                        "tool": "searxng_search",
+                        "query": query,
+                        "window": format_range(start, end),
+                        "result_count": len(tool_articles),
+                        "results": compact_tool_observations(tool_articles),
+                    }
+                else:
+                    observation = {
+                        "tool": "searxng_search",
+                        "query": query,
+                        "window": format_range(start, end),
+                        "error": "SearXNG tool failed or disabled",
+                        "results": [],
+                    }
+
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "Tool observation JSON:\n" + json.dumps(observation, ensure_ascii=False),
+                    }
+                )
+                continue
+
+            if action_name == "final":
+                valid = validate_research_package(action.get("articles"), group, topic, observed_articles)
+                if valid:
+                    set_cache(cache_key, json.dumps(valid, ensure_ascii=False))
+                logger.info("Agent 1 tool researcher: %s -> %d bai sau %d buoc", topic, len(valid), step + 1)
+                return valid
+
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Action khong hop le. Chi dung action=search hoac action=final.",
+                }
+            )
+
+        if observed_articles:
+            messages.append(
                 {
                     "role": "user",
                     "content": (
-                        f"Chu de: {topic}\n"
-                        f"Khung thoi gian (gio VN): {format_range(start, end)}\n"
-                        "Hay tim tin moi nhat va tra ve JSON array."
+                        "Da het so buoc tool. Hay final ngay, chi dung URL trong observations. "
+                        "Tra ve action=final."
                     ),
-                },
-            ],
-            max_tokens=Config.RESEARCH_MAX_TOKENS,
-        )
+                }
+            )
+            result = await _api_call(
+                session,
+                RESEARCH_API_BASE,
+                RESEARCH_API_KEY,
+                RESEARCH_MODEL,
+                messages=messages,
+                max_tokens=Config.RESEARCH_MAX_TOKENS,
+            )
+            if result:
+                raw = result["choices"][0]["message"].get("content", "")
+                action = parse_research_action(raw)
+                if isinstance(action, dict):
+                    valid = validate_research_package(action.get("articles"), group, topic, observed_articles)
+                    if valid:
+                        set_cache(cache_key, json.dumps(valid, ensure_ascii=False))
+                    logger.info("Agent 1 tool researcher final forced: %s -> %d bai", topic, len(valid))
+                    return valid
 
-    if not result:
-        return []
-
-    raw      = result["choices"][0]["message"]["content"]
-    articles = extract_json_array(raw)  # FIX E
-
-    if not isinstance(articles, list):
-        return []
-
-    # FIX F: validate schema, gắn nhóm
-    valid = []
-    for art in articles:
-        if valid_article(art):
-            art["_group"] = group
-            valid.append(art)
-
-    if valid:
-        set_cache(cache_key, json.dumps(valid))
-
-    return valid
+    return []
 
 # =========================================================
 # AGENT 2 — JUDGE / EDITOR
@@ -1413,8 +1771,10 @@ async def cmd_status(ctx: commands.Context):
     embed.add_field(name="Editor Parallel",   value=str(Config.MAX_PARALLEL_EDITOR),           inline=True)
     embed.add_field(name="Researcher",     value=f"`{RESEARCH_MODEL}`",                        inline=True)
     embed.add_field(name="Editor",         value=f"`{EDITOR_MODEL}`",                          inline=True)
-    embed.add_field(name="API Base",       value=RESEARCH_API_BASE or "Chua dat",              inline=False)
-    embed.add_field(name="Tavily",         value="ON" if TAVILY_ENABLED else "OFF",            inline=True)
+    embed.add_field(name="Research API",   value=RESEARCH_API_BASE or "Chua dat",              inline=False)
+    embed.add_field(name="Agent 1 Flow",   value="Tool-using researcher -> SearXNG",           inline=False)
+    embed.add_field(name="Tavily",         value="Legacy" if TAVILY_ENABLED else "OFF",        inline=True)
+    embed.add_field(name="SearXNG Tool",   value="ON" if SEARXNG_ENABLED else "OFF",           inline=True)
     await ctx.send(embed=embed, allowed_mentions=NO_MENTIONS)
 
 
@@ -1487,16 +1847,21 @@ if __name__ == "__main__":
         raise SystemExit("Thieu DISCORD_TOKEN trong .env")
     if not CHANNEL_ID:
         raise SystemExit("Thieu CHANNEL_ID trong .env")
-    if not TAVILY_ENABLED:
-        if not RESEARCH_API_BASE:
-            raise SystemExit("Thieu RESEARCH_API_BASE (hoac API_BASE) trong .env khi TAVILY_API_KEY chua dat")
-        if not RESEARCH_API_KEY:
-            raise SystemExit("Thieu RESEARCH_API_KEY (hoac API_KEY) trong .env khi TAVILY_API_KEY chua dat")
+    if not RESEARCH_API_BASE:
+        raise SystemExit("Thieu RESEARCH_API_BASE (hoac API_BASE) trong .env")
+    if not RESEARCH_API_KEY:
+        raise SystemExit("Thieu RESEARCH_API_KEY (hoac API_KEY) trong .env")
+    if not RESEARCH_MODEL:
+        raise SystemExit("Thieu RESEARCH_MODEL (hoac MODEL_NAME) trong .env")
+    if not SEARXNG_ENABLED:
+        raise SystemExit("Thieu SEARXNG_BASE_URL hoac SEARXNG_ENABLED dang OFF; Agent 1 can SearXNG tool")
     if not EDITOR_API_BASE:   # FIX J
         raise SystemExit("Thieu EDITOR_API_BASE (hoac API_BASE) trong .env")
     if not EDITOR_API_KEY:    # FIX J
         raise SystemExit("Thieu EDITOR_API_KEY (hoac API_KEY) trong .env")
 
-    logger.info("Tavily search: %s", "ON" if TAVILY_ENABLED else "OFF")
+    logger.info("Agent 1 flow: RESEARCH_MODEL -> SearXNG tool -> structured package")
+    logger.info("Tavily legacy backend: %s", "ON" if TAVILY_ENABLED else "OFF")
+    logger.info("SearXNG tool: %s", "ON" if SEARXNG_ENABLED else "OFF")
     logger.info("Starting Multi-Agent News Bot...")
     bot.run(DISCORD_TOKEN)
