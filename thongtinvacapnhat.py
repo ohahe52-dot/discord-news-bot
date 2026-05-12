@@ -88,14 +88,14 @@ SEARXNG_ENABLED  = bool(SEARXNG_BASE_URL) and os.getenv("SEARXNG_ENABLED", "1").
 
 class Config:
     SEARCH_INTERVAL_HOURS = 12
-    MAX_RETRIES           = int(os.getenv("MAX_RETRIES", "3") or 3)
-    RETRY_DELAY           = float(os.getenv("RETRY_DELAY", "2") or 2)
-    API_RETRY_JITTER      = float(os.getenv("API_RETRY_JITTER", "1.5") or 1.5)
+    MAX_RETRIES           = int(os.getenv("MAX_RETRIES", "3"))
+    RETRY_DELAY           = float(os.getenv("RETRY_DELAY", "2"))
+    API_RETRY_JITTER      = float(os.getenv("API_RETRY_JITTER", "1.5"))
     REQUEST_TIMEOUT       = 600
 
-    MAX_PARALLEL_RESEARCH = int(os.getenv("MAX_PARALLEL_RESEARCH", "4") or 4)
-    MAX_PARALLEL_EDITOR   = int(os.getenv("MAX_PARALLEL_EDITOR", "4") or 4)
-    MAX_PARALLEL_SEARXNG  = int(os.getenv("MAX_PARALLEL_SEARXNG", "2") or 2)
+    MAX_PARALLEL_RESEARCH = int(os.getenv("MAX_PARALLEL_RESEARCH", "40"))
+    MAX_PARALLEL_EDITOR   = int(os.getenv("MAX_PARALLEL_EDITOR", "10"))
+    MAX_PARALLEL_SEARXNG  = int(os.getenv("MAX_PARALLEL_SEARXNG", "10"))
     MAX_PLAIN_TEXT        = 1900
     DISCORD_DELAY         = 0.4
 
