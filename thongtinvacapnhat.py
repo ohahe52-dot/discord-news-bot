@@ -102,10 +102,10 @@ class Config:
     SEARCH_CONNECT_TIMEOUT = float(os.getenv("SEARCH_CONNECT_TIMEOUT", "8") or 8)
     SEARCH_SOCK_READ_TIMEOUT = float(os.getenv("SEARCH_SOCK_READ_TIMEOUT", "25") or 25)
 
-    MAX_PARALLEL_RESEARCH = int(os.getenv("MAX_PARALLEL_RESEARCH", "4") or 4)
-    MAX_PARALLEL_EDITOR   = int(os.getenv("MAX_PARALLEL_EDITOR", "4") or 4)
-    MAX_PARALLEL_SEARXNG  = int(os.getenv("MAX_PARALLEL_SEARXNG", "2") or 2)
-    RESEARCH_QUEUE_MAX    = int(os.getenv("RESEARCH_QUEUE_MAX", "24") or 24)
+    MAX_PARALLEL_RESEARCH = int(os.getenv("MAX_PARALLEL_RESEARCH", "50"))
+    MAX_PARALLEL_EDITOR   = int(os.getenv("MAX_PARALLEL_EDITOR", "50"))
+    MAX_PARALLEL_SEARXNG  = int(os.getenv("MAX_PARALLEL_SEARXNG", "50"))
+    RESEARCH_QUEUE_MAX    = int(os.getenv("RESEARCH_QUEUE_MAX", "24"))
     MAX_PLAIN_TEXT        = 1900
     DISCORD_DELAY         = 0.4
 
