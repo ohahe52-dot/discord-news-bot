@@ -75,12 +75,13 @@ TAVILY_ENABLED   = bool(TAVILY_API_KEY) and os.getenv("TAVILY_ENABLED", "1").str
 # =========================================================
 
 class Config:
-    SEARCH_INTERVAL_HOURS = 6
+    SEARCH_INTERVAL_HOURS = 12
     MAX_RETRIES           = 5
     RETRY_DELAY           = 2
     REQUEST_TIMEOUT       = 600
 
     MAX_PARALLEL_RESEARCH = 35
+    MAX_PARALLEL_EDITOR   = 8
     MAX_PLAIN_TEXT        = 1900
     DISCORD_DELAY         = 0.4
 
@@ -98,7 +99,7 @@ class Config:
     SENT_URLS_FILE        = "sent_urls.json"
     SENT_URLS_MAX         = 2000
 
-    SLOTS                 = [0, 6, 12, 18]
+    SLOTS                 = [6, 18]
     SCHEDULER_RETRY_DELAY = 300
     SCHEDULER_SLOT_MAX_RETRIES = int(os.getenv("SCHEDULER_SLOT_MAX_RETRIES", "3") or 3)
     BACKGROUND_TASK_RESTART_DELAY = 30
@@ -209,6 +210,7 @@ NO_MENTIONS = discord.AllowedMentions.none()
 CACHE: Dict[str, Dict[str, Any]] = {}
 VN_TZ = timezone(timedelta(hours=Config.TIMEZONE_OFFSET))
 research_semaphore = asyncio.Semaphore(Config.MAX_PARALLEL_RESEARCH)
+editor_semaphore   = asyncio.Semaphore(Config.MAX_PARALLEL_EDITOR)
 state_lock         = asyncio.Lock()
 sent_urls_lock     = asyncio.Lock()
 digest_lock        = asyncio.Lock()
@@ -877,32 +879,49 @@ Output CHI la JSON object, tuyet doi khong co text thua ben ngoai:
 Tags goi y (chon 1-3): Viral, AI, Canh bao, Moi, Game, Tai chinh, The gioi, Viet Nam, Suc khoe, Phim"""
 
 
-async def judge_news(
+def group_articles_for_editor(raw_articles: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Gom bài theo nhóm để Agent 2 chạy nhiều request song song."""
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for art in raw_articles:
+        if not isinstance(art, dict):
+            continue
+        group_name = str(
+            art.get("_group") or art.get("group") or art.get("topic") or "Khac"
+        ).strip() or "Khac"
+        grouped.setdefault(group_name, []).append(art)
+    return grouped
+
+
+async def judge_article_group(
     session: aiohttp.ClientSession,
-    raw_articles: List[Dict[str, Any]],
+    group_name: str,
+    articles: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Agent 2: nhận list bài thô → ranked JSON đã filter."""
-    if not raw_articles:
+    """Agent 2: judge riêng 1 nhóm tin, dùng cho đa request/response."""
+    if not articles:
         return None
 
-    result = await _api_call(
-        session,
-        EDITOR_API_BASE,
-        EDITOR_API_KEY,
-        EDITOR_MODEL,
-        messages=[
-            {"role": "system", "content": EDITOR_SYSTEM},
-            {
-                "role": "user",
-                "content": (
-                    f"Co {len(raw_articles)} bai bao tho duoi day.\n"
-                    "Hay danh gia, loc va tra ve JSON chuan:\n\n"
-                    + json.dumps(raw_articles, ensure_ascii=False)
-                ),
-            },
-        ],
-        max_tokens=Config.EDITOR_MAX_TOKENS,
-    )
+    async with editor_semaphore:
+        result = await _api_call(
+            session,
+            EDITOR_API_BASE,
+            EDITOR_API_KEY,
+            EDITOR_MODEL,
+            messages=[
+                {"role": "system", "content": EDITOR_SYSTEM},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Chi danh gia nhom: {group_name}\n"
+                        f"Co {len(articles)} bai bao tho duoi day.\n"
+                        "Hay danh gia, loc va tra ve JSON chuan. "
+                        "Truong groups chi gom dung nhom nay:\n\n"
+                        + json.dumps(articles, ensure_ascii=False)
+                    ),
+                },
+            ],
+            max_tokens=Config.EDITOR_MAX_TOKENS,
+        )
 
     if not result:
         return None
@@ -911,10 +930,67 @@ async def judge_news(
     judged = extract_json_object(raw)  # FIX E
 
     if not isinstance(judged, dict) or "groups" not in judged:
-        logger.error("Judge tra ve sai schema. Raw: %s", raw[:300])
+        logger.error("Judge nhom %s tra ve sai schema. Raw: %s", group_name, raw[:300])
         return None
 
-    return judged
+    groups = judged.get("groups", {})
+    if not isinstance(groups, dict):
+        return None
+
+    selected = groups.get(group_name)
+    if selected is None and groups:
+        selected = next(iter(groups.values()))
+    if not isinstance(selected, list):
+        return None
+
+    return {
+        "groups": {group_name: selected},
+        "highlight": str(judged.get("highlight", "")).strip(),
+    }
+
+
+async def judge_news(
+    session: aiohttp.ClientSession,
+    raw_articles: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Agent 2: đa request/response theo từng nhóm tin → merge ranked JSON."""
+    if not raw_articles:
+        return None
+
+    grouped = group_articles_for_editor(raw_articles)
+    if not grouped:
+        return None
+
+    group_names = list(grouped.keys())
+    tasks = [judge_article_group(session, name, grouped[name]) for name in group_names]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    merged_groups: Dict[str, List[Dict[str, Any]]] = {}
+    highlights: List[str] = []
+
+    for group_name, result in zip(group_names, results):
+        if isinstance(result, Exception):
+            logger.error("Judge nhom %s loi: %s", group_name, result)
+            continue
+        if not isinstance(result, dict):
+            continue
+
+        groups = result.get("groups", {})
+        articles = groups.get(group_name, []) if isinstance(groups, dict) else []
+        if isinstance(articles, list) and articles:
+            merged_groups[group_name] = articles
+            highlight = str(result.get("highlight", "")).strip()
+            if highlight:
+                highlights.append(highlight)
+
+    if not merged_groups:
+        return None
+
+    logger.info("Agent 2: judge song song %d/%d nhom", len(merged_groups), len(grouped))
+    return {
+        "groups": merged_groups,
+        "highlight": highlights[0] if highlights else "Tin noi bat da duoc chon loc tu cac nhom.",
+    }
 
 # =========================================================
 # FULL PIPELINE: collect → filter → judge
@@ -1138,7 +1214,7 @@ async def send_ranked_digest(
         timestamp=datetime.now(timezone.utc),
     )
     header.set_footer(
-        text=f"Multi-Agent | {total_topics} topics | 6h | Anti-dup ON"
+        text=f"Multi-Agent | {total_topics} topics | 06:00 & 18:00 VN | Anti-dup ON"
     )
     await channel.send(embed=header, allowed_mentions=NO_MENTIONS)
     await asyncio.sleep(0.8)
@@ -1333,7 +1409,8 @@ async def cmd_status(ctx: commands.Context):
     embed.add_field(name="Da gui moc",     value=saved_key or "Chua co",                       inline=True)  # FIX A
     embed.add_field(name="Nhom/Chu de",    value=f"{len(TOPIC_GROUPS)} / {sum(len(v) for v in TOPIC_GROUPS.values())}", inline=True)
     embed.add_field(name="URLs da nho",    value=f"{sent_count} bai",                          inline=True)
-    embed.add_field(name="Parallel",       value=str(Config.MAX_PARALLEL_RESEARCH),            inline=True)
+    embed.add_field(name="Research Parallel", value=str(Config.MAX_PARALLEL_RESEARCH),         inline=True)
+    embed.add_field(name="Editor Parallel",   value=str(Config.MAX_PARALLEL_EDITOR),           inline=True)
     embed.add_field(name="Researcher",     value=f"`{RESEARCH_MODEL}`",                        inline=True)
     embed.add_field(name="Editor",         value=f"`{EDITOR_MODEL}`",                          inline=True)
     embed.add_field(name="API Base",       value=RESEARCH_API_BASE or "Chua dat",              inline=False)
@@ -1380,7 +1457,7 @@ async def on_ready():
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name=f"{total} topics | Multi-Agent | 6h",
+            name=f"{total} topics | 06:00 & 18:00 VN",
         )
     )
     if not scheduler_started:
