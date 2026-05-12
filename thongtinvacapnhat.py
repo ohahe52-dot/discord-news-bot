@@ -18,14 +18,16 @@ Fixes applied (from review):
 
 import asyncio
 import hashlib
+import html as html_lib
 import json
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
 import discord
@@ -70,7 +72,13 @@ TAVILY_API_KEY   = os.getenv("TAVILY_API_KEY", "").strip()
 TAVILY_API_BASE  = os.getenv("TAVILY_API_BASE", "https://api.tavily.com").rstrip("/")
 TAVILY_ENABLED   = bool(TAVILY_API_KEY) and os.getenv("TAVILY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 
-# SearXNG — tool search do Agent 1 truc tiep goi
+# Web Search compatible endpoint — tool search do Agent 1 truc tiep goi
+WEB_SEARCH_API_BASE = os.getenv("WEB_SEARCH_API_BASE", RESEARCH_API_BASE).rstrip("/")
+WEB_SEARCH_API_KEY  = os.getenv("WEB_SEARCH_API_KEY", RESEARCH_API_KEY).strip()
+WEB_SEARCH_MODEL    = os.getenv("WEB_SEARCH_MODEL", "searxng").strip()
+WEB_SEARCH_ENABLED  = bool(WEB_SEARCH_API_BASE and WEB_SEARCH_API_KEY) and os.getenv("WEB_SEARCH_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+# SearXNG direct GET — legacy fallback neu compatible endpoint khong dung duoc
 SEARXNG_BASE_URL = os.getenv("SEARXNG_BASE_URL", "").rstrip("/")
 SEARXNG_ENABLED  = bool(SEARXNG_BASE_URL) and os.getenv("SEARXNG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 
@@ -80,12 +88,14 @@ SEARXNG_ENABLED  = bool(SEARXNG_BASE_URL) and os.getenv("SEARXNG_ENABLED", "1").
 
 class Config:
     SEARCH_INTERVAL_HOURS = 12
-    MAX_RETRIES           = 5
-    RETRY_DELAY           = 2
+    MAX_RETRIES           = int(os.getenv("MAX_RETRIES", "3") or 3)
+    RETRY_DELAY           = float(os.getenv("RETRY_DELAY", "2") or 2)
+    API_RETRY_JITTER      = float(os.getenv("API_RETRY_JITTER", "1.5") or 1.5)
     REQUEST_TIMEOUT       = 600
 
-    MAX_PARALLEL_RESEARCH = 50
-    MAX_PARALLEL_EDITOR   = 15
+    MAX_PARALLEL_RESEARCH = int(os.getenv("MAX_PARALLEL_RESEARCH", "4") or 4)
+    MAX_PARALLEL_EDITOR   = int(os.getenv("MAX_PARALLEL_EDITOR", "4") or 4)
+    MAX_PARALLEL_SEARXNG  = int(os.getenv("MAX_PARALLEL_SEARXNG", "2") or 2)
     MAX_PLAIN_TEXT        = 1900
     DISCORD_DELAY         = 0.4
 
@@ -112,10 +122,18 @@ class Config:
     TAVILY_MAX_RESULTS    = int(os.getenv("TAVILY_MAX_RESULTS", "4") or 4)
     TAVILY_SEARCH_DEPTH   = os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip() or "basic"
 
+    WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "15") or 15)
+    WEB_SEARCH_TYPE       = os.getenv("WEB_SEARCH_TYPE", "web").strip() or "web"
+
     SEARXNG_MAX_RESULTS   = int(os.getenv("SEARXNG_MAX_RESULTS", "5") or 5)
     SEARXNG_CATEGORIES    = os.getenv("SEARXNG_CATEGORIES", "news,general").strip() or "news,general"
     SEARXNG_LANGUAGE      = os.getenv("SEARXNG_LANGUAGE", "all").strip() or "all"
     SEARXNG_TIME_RANGE    = os.getenv("SEARXNG_TIME_RANGE", "day").strip() or "day"
+    SEARXNG_HTML_FALLBACK = os.getenv("SEARXNG_HTML_FALLBACK", "1").strip().lower() not in {"0", "false", "no", "off"}
+    SEARXNG_USER_AGENT    = os.getenv(
+        "SEARXNG_USER_AGENT",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    ).strip()
 
     # Tracking params cần loại bỏ khi normalize URL
     TRACKING_PARAMS = {
@@ -221,6 +239,7 @@ CACHE: Dict[str, Dict[str, Any]] = {}
 VN_TZ = timezone(timedelta(hours=Config.TIMEZONE_OFFSET))
 research_semaphore = asyncio.Semaphore(Config.MAX_PARALLEL_RESEARCH)
 editor_semaphore   = asyncio.Semaphore(Config.MAX_PARALLEL_EDITOR)
+searxng_semaphore  = asyncio.Semaphore(Config.MAX_PARALLEL_SEARXNG)
 state_lock         = asyncio.Lock()
 sent_urls_lock     = asyncio.Lock()
 digest_lock        = asyncio.Lock()
@@ -228,6 +247,7 @@ last_sent_key      = ""          # FIX A: lưu "YYYY-MM-DD-HH" thay vì chỉ sl
 last_processed_key = ""          # mốc cuối đã gửi thành công hoặc đã bỏ qua sau retry limit
 scheduler_started  = False
 cache_cleanup_started = False
+searxng_json_blocked = False
 
 # =========================================================
 # TIME HELPERS
@@ -611,27 +631,28 @@ async def _api_call(
                 ),
             ) as resp:
                 if resp.status in {429, 500, 502, 503, 504}:
+                    body = (await resp.text())[:300]
                     if attempt < Config.MAX_RETRIES:
-                        delay = Config.RETRY_DELAY * (2 ** attempt)
+                        delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
                         logger.warning(
-                            "Retry %s/%s sau %.1fs (HTTP %s)",
-                            attempt + 1, Config.MAX_RETRIES, delay, resp.status,
+                            "Retry API model=%s %s/%s sau %.1fs (HTTP %s): %s",
+                            model, attempt + 1, Config.MAX_RETRIES, delay, resp.status, body,
                         )
                         await asyncio.sleep(delay)
                         continue
-                    logger.error("Het retry (HTTP %s)", resp.status)
+                    logger.error("Het retry API model=%s (HTTP %s): %s", model, resp.status, body)
                     return None
 
                 if resp.status != 200:
-                    logger.error("API %s: %s", resp.status, await resp.text())
+                    logger.error("API model=%s %s: %s", model, resp.status, await resp.text())
                     return None
 
                 return await parse_openai_response(resp)
 
         except asyncio.TimeoutError:
             if attempt < Config.MAX_RETRIES:
-                delay = Config.RETRY_DELAY * (2 ** attempt)
-                logger.warning("Timeout retry %s/%s sau %.1fs", attempt + 1, Config.MAX_RETRIES, delay)
+                delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
+                logger.warning("Timeout retry model=%s %s/%s sau %.1fs", model, attempt + 1, Config.MAX_RETRIES, delay)
                 await asyncio.sleep(delay)
             else:
                 logger.error("Het retry do timeout")
@@ -639,8 +660,8 @@ async def _api_call(
 
         except Exception as e:
             if attempt < Config.MAX_RETRIES:
-                delay = Config.RETRY_DELAY * (2 ** attempt)
-                logger.warning("Loi API retry %s/%s: %s", attempt + 1, Config.MAX_RETRIES, e)
+                delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
+                logger.warning("Loi API retry model=%s %s/%s: %s", model, attempt + 1, Config.MAX_RETRIES, e)
                 await asyncio.sleep(delay)
             else:
                 logger.error("Het retry: %s", e)
@@ -759,63 +780,184 @@ async def tavily_search_topic(
     return articles
 
 
-async def searxng_search_query(
+def search_tool_enabled() -> bool:
+    return WEB_SEARCH_ENABLED or SEARXNG_ENABLED
+
+
+def web_search_url() -> str:
+    base = WEB_SEARCH_API_BASE.rstrip("/")
+    return base if base.endswith("/search") else f"{base}/search"
+
+
+def web_search_articles_from_payload(
+    payload: Any,
+    clean_query: str,
+    group: str,
+    topic: str,
+    start: datetime,
+    end: datetime,
+) -> List[Dict[str, Any]]:
+    if isinstance(payload, dict) and isinstance(payload.get("choices"), list):
+        try:
+            content = payload["choices"][0].get("message", {}).get("content", "")
+            parsed = extract_json_object(content) or extract_json_array(content)
+            if parsed is not None:
+                return web_search_articles_from_payload(parsed, clean_query, group, topic, start, end)
+        except Exception:
+            pass
+
+    items: List[Any] = []
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        for key in ("results", "data", "items", "documents", "sources"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+        if not items and isinstance(payload.get("result"), list):
+            items = payload.get("result", [])
+
+    articles: List[Dict[str, Any]] = []
+    for item in items[:Config.WEB_SEARCH_MAX_RESULTS]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("name") or item.get("headline") or "").strip()
+        url = str(item.get("url") or item.get("link") or item.get("href") or item.get("source_url") or "").strip()
+        summary = str(
+            item.get("content")
+            or item.get("snippet")
+            or item.get("description")
+            or item.get("summary")
+            or item.get("text")
+            or title
+        ).strip()
+        published = item.get("publishedDate") or item.get("published_date") or item.get("published") or item.get("date")
+        if published:
+            summary = f"{summary}\nNgay dang: {published}".strip()
+        raw_source = item.get("source") or item.get("engine") or item.get("provider") or ""
+        if isinstance(raw_source, dict):
+            source = str(raw_source.get("name") or raw_source.get("title") or source_from_url(url)).strip()
+        else:
+            source = str(raw_source or source_from_url(url)).strip()
+        art = {
+            "title": title,
+            "summary": summary,
+            "url": url,
+            "source": source,
+            "topic": topic,
+            "importance": importance_from_score(item.get("score", item.get("rank_score", 0.5))),
+            "published_at": str(published or "").strip(),
+            "search_query": clean_query,
+            "time_window": format_range(start, end),
+            "_group": group,
+        }
+        if valid_article(art) and url:
+            articles.append(art)
+
+    return merge_unique_articles(articles)
+
+
+async def compatible_web_search_query(
     session: aiohttp.ClientSession,
-    query: str,
+    clean_query: str,
     group: str,
     topic: str,
     start: datetime,
     end: datetime,
 ) -> Optional[List[Dict[str, Any]]]:
-    """Tool SearXNG: Agent 1 tu sinh query, backend chi thuc thi tool call."""
-    if not SEARXNG_ENABLED:
+    if not WEB_SEARCH_ENABLED:
         return None
 
-    clean_query = re.sub(r"\s+", " ", query).strip()[:300]
-    if not clean_query:
-        return []
-
-    params = {
-        "q": clean_query,
-        "format": "json",
-        "categories": Config.SEARXNG_CATEGORIES,
-        "language": Config.SEARXNG_LANGUAGE,
-        "time_range": Config.SEARXNG_TIME_RANGE,
-        "safesearch": "0",
+    payload = {
+        "model": WEB_SEARCH_MODEL,
+        "query": clean_query,
+        "search_type": Config.WEB_SEARCH_TYPE,
+        "max_results": Config.WEB_SEARCH_MAX_RESULTS,
     }
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {WEB_SEARCH_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
-    data: Optional[Dict[str, Any]] = None
     for attempt in range(Config.MAX_RETRIES + 1):
         try:
-            async with session.get(
-                f"{SEARXNG_BASE_URL}/search",
-                params=params,
+            async with session.post(
+                web_search_url(),
                 headers=headers,
+                json=payload,
                 timeout=aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT),
             ) as resp:
+                body = await resp.text()
                 if resp.status in {429, 500, 502, 503, 504} and attempt < Config.MAX_RETRIES:
-                    delay = Config.RETRY_DELAY * (2 ** attempt)
-                    logger.warning("SearXNG tool retry %s/%s sau %.1fs (HTTP %s)", attempt + 1, Config.MAX_RETRIES, delay, resp.status)
+                    delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
+                    logger.warning("Web search retry %s/%s sau %.1fs (HTTP %s)", attempt + 1, Config.MAX_RETRIES, delay, resp.status)
                     await asyncio.sleep(delay)
                     continue
                 if resp.status != 200:
-                    logger.error("SearXNG tool API %s: %s", resp.status, (await resp.text())[:300])
+                    logger.error("Web search API %s: %s", resp.status, body[:300])
                     return None
-                data = await resp.json(content_type=None)
-                break
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    data = await resp.json(content_type=None)
+                articles = web_search_articles_from_payload(data, clean_query, group, topic, start, end)
+                logger.info("Web search tool: %s -> %d ket qua", clean_query, len(articles))
+                return articles
         except Exception as e:
             if attempt < Config.MAX_RETRIES:
-                delay = Config.RETRY_DELAY * (2 ** attempt)
-                logger.warning("SearXNG tool loi retry %s/%s: %s", attempt + 1, Config.MAX_RETRIES, e)
+                delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
+                logger.warning("Web search loi retry %s/%s: %s", attempt + 1, Config.MAX_RETRIES, e)
                 await asyncio.sleep(delay)
             else:
-                logger.error("SearXNG tool het retry: %s", e)
+                logger.error("Web search het retry: %s", e)
                 return None
 
-    if not isinstance(data, dict):
-        return None
+    return None
 
+
+def searxng_headers(kind: str = "json") -> Dict[str, str]:
+    accept = "application/json" if kind == "json" else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    return {
+        "Accept": accept,
+        "Accept-Language": "vi,en-US;q=0.9,en;q=0.8",
+        "User-Agent": Config.SEARXNG_USER_AGENT,
+    }
+
+
+def strip_html_fragment(value: str) -> str:
+    value = re.sub(r"(?is)<(script|style).*?</\1>", " ", value)
+    value = re.sub(r"(?is)<[^>]+>", " ", value)
+    return re.sub(r"\s+", " ", html_lib.unescape(value)).strip()
+
+
+def resolve_searxng_href(href: str) -> str:
+    href = html_lib.unescape(href).strip()
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    if href.startswith("/"):
+        parsed = urlparse(href)
+        qs = parse_qs(parsed.query)
+        for key in ("url", "q", "u"):
+            if qs.get(key):
+                candidate = unquote(qs[key][0]).strip()
+                if candidate.startswith(("http://", "https://")):
+                    return candidate
+        href = urljoin(SEARXNG_BASE_URL + "/", href.lstrip("/"))
+    return href
+
+
+def searxng_articles_from_json(
+    data: Dict[str, Any],
+    clean_query: str,
+    group: str,
+    topic: str,
+    start: datetime,
+    end: datetime,
+) -> List[Dict[str, Any]]:
     articles: List[Dict[str, Any]] = []
     for item in data.get("results", [])[:Config.SEARXNG_MAX_RESULTS]:
         if not isinstance(item, dict):
@@ -846,9 +988,195 @@ async def searxng_search_query(
         }
         if valid_article(art) and url:
             articles.append(art)
-
-    logger.info("SearXNG tool: %s -> %d ket qua", clean_query, len(articles))
     return articles
+
+
+def parse_searxng_html_results(
+    page: str,
+    clean_query: str,
+    group: str,
+    topic: str,
+    start: datetime,
+    end: datetime,
+) -> List[Dict[str, Any]]:
+    blocks = re.findall(
+        r"(?is)<article\b[^>]*class=[\"'][^\"']*\bresult\b[^\"']*[\"'][^>]*>(.*?)</article>",
+        page,
+    )
+    if not blocks:
+        blocks = [page[m.start():m.start() + 2600] for m in re.finditer(r"(?is)<h3\b[^>]*>.*?</h3>", page)]
+
+    articles: List[Dict[str, Any]] = []
+    for block in blocks:
+        link = re.search(r"(?is)<h3\b[^>]*>.*?<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>.*?</h3>", block)
+        if not link:
+            link = re.search(r"(?is)<a\b[^>]*class=[\"'][^\"']*result[^\"']*[\"'][^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", block)
+        if not link:
+            continue
+
+        url = resolve_searxng_href(link.group(1))
+        if not url.startswith(("http://", "https://")):
+            continue
+
+        title = strip_html_fragment(link.group(2))
+        summary_match = re.search(
+            r"(?is)<p\b[^>]*class=[\"'][^\"']*(?:content|snippet)[^\"']*[\"'][^>]*>(.*?)</p>",
+            block,
+        ) or re.search(r"(?is)<p\b[^>]*>(.*?)</p>", block)
+        summary = strip_html_fragment(summary_match.group(1)) if summary_match else title
+        source = source_from_url(url)
+        art = {
+            "title": title,
+            "summary": summary,
+            "url": url,
+            "source": source,
+            "topic": topic,
+            "importance": 50,
+            "published_at": "",
+            "search_query": clean_query,
+            "time_window": format_range(start, end),
+            "_group": group,
+        }
+        if valid_article(art):
+            articles.append(art)
+        if len(articles) >= Config.SEARXNG_MAX_RESULTS:
+            break
+
+    return merge_unique_articles(articles)
+
+
+async def searxng_search_html(
+    session: aiohttp.ClientSession,
+    clean_query: str,
+    group: str,
+    topic: str,
+    start: datetime,
+    end: datetime,
+) -> Optional[List[Dict[str, Any]]]:
+    params = {
+        "q": clean_query,
+        "categories": Config.SEARXNG_CATEGORIES,
+        "language": Config.SEARXNG_LANGUAGE,
+        "time_range": Config.SEARXNG_TIME_RANGE,
+        "safesearch": "0",
+    }
+
+    for attempt in range(Config.MAX_RETRIES + 1):
+        try:
+            async with session.get(
+                f"{SEARXNG_BASE_URL}/search",
+                params=params,
+                headers=searxng_headers("html"),
+                timeout=aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT),
+            ) as resp:
+                body = await resp.text()
+                if resp.status in {429, 500, 502, 503, 504} and attempt < Config.MAX_RETRIES:
+                    delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
+                    logger.warning("SearXNG HTML retry %s/%s sau %.1fs (HTTP %s)", attempt + 1, Config.MAX_RETRIES, delay, resp.status)
+                    await asyncio.sleep(delay)
+                    continue
+                if resp.status != 200:
+                    logger.error("SearXNG HTML API %s: %s", resp.status, body[:300])
+                    return None
+                articles = parse_searxng_html_results(body, clean_query, group, topic, start, end)
+                logger.info("SearXNG HTML tool: %s -> %d ket qua", clean_query, len(articles))
+                return articles
+        except Exception as e:
+            if attempt < Config.MAX_RETRIES:
+                delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
+                logger.warning("SearXNG HTML loi retry %s/%s: %s", attempt + 1, Config.MAX_RETRIES, e)
+                await asyncio.sleep(delay)
+            else:
+                logger.error("SearXNG HTML het retry: %s", e)
+                return None
+
+    return None
+
+
+async def searxng_search_query(
+    session: aiohttp.ClientSession,
+    query: str,
+    group: str,
+    topic: str,
+    start: datetime,
+    end: datetime,
+) -> Optional[List[Dict[str, Any]]]:
+    """Tool web search: Agent 1 tu sinh query, backend chi thuc thi tool call."""
+    global searxng_json_blocked
+
+    if not search_tool_enabled():
+        return None
+
+    clean_query = re.sub(r"\s+", " ", query).strip()[:300]
+    if not clean_query:
+        return []
+
+    async with searxng_semaphore:
+        await asyncio.sleep(random.uniform(0.15, 0.8))
+
+        web_articles = await compatible_web_search_query(session, clean_query, group, topic, start, end)
+        if isinstance(web_articles, list):
+            return web_articles
+        if not SEARXNG_ENABLED:
+            return None
+
+        if searxng_json_blocked and Config.SEARXNG_HTML_FALLBACK:
+            return await searxng_search_html(session, clean_query, group, topic, start, end)
+
+        params = {
+            "q": clean_query,
+            "format": "json",
+            "categories": Config.SEARXNG_CATEGORIES,
+            "language": Config.SEARXNG_LANGUAGE,
+            "time_range": Config.SEARXNG_TIME_RANGE,
+            "safesearch": "0",
+        }
+
+        data: Optional[Dict[str, Any]] = None
+        for attempt in range(Config.MAX_RETRIES + 1):
+            try:
+                async with session.get(
+                    f"{SEARXNG_BASE_URL}/search",
+                    params=params,
+                    headers=searxng_headers("json"),
+                    timeout=aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT),
+                ) as resp:
+                    body = await resp.text()
+                    if resp.status == 403 and Config.SEARXNG_HTML_FALLBACK:
+                        searxng_json_blocked = True
+                        logger.warning(
+                            "SearXNG JSON 403. Co the search.formats chua bat json; chuyen sang HTML fallback. Body: %s",
+                            body[:200],
+                        )
+                        return await searxng_search_html(session, clean_query, group, topic, start, end)
+                    if resp.status in {429, 500, 502, 503, 504} and attempt < Config.MAX_RETRIES:
+                        delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
+                        logger.warning("SearXNG JSON retry %s/%s sau %.1fs (HTTP %s)", attempt + 1, Config.MAX_RETRIES, delay, resp.status)
+                        await asyncio.sleep(delay)
+                        continue
+                    if resp.status != 200:
+                        logger.error("SearXNG JSON API %s: %s", resp.status, body[:300])
+                        return None
+                    try:
+                        data = json.loads(body)
+                    except Exception:
+                        data = await resp.json(content_type=None)
+                    break
+            except Exception as e:
+                if attempt < Config.MAX_RETRIES:
+                    delay = Config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, Config.API_RETRY_JITTER)
+                    logger.warning("SearXNG JSON loi retry %s/%s: %s", attempt + 1, Config.MAX_RETRIES, e)
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error("SearXNG JSON het retry: %s", e)
+                    return None
+
+        if not isinstance(data, dict):
+            return None
+
+        articles = searxng_articles_from_json(data, clean_query, group, topic, start, end)
+        logger.info("SearXNG JSON tool: %s -> %d ket qua", clean_query, len(articles))
+        return articles
 
 
 async def searxng_search_topic(
@@ -1068,8 +1396,8 @@ async def research_topic(
     if not RESEARCH_API_BASE or not RESEARCH_API_KEY or not RESEARCH_MODEL:
         logger.error("Agent 1 thieu RESEARCH_API_BASE/RESEARCH_API_KEY/RESEARCH_MODEL")
         return []
-    if not SEARXNG_ENABLED:
-        logger.error("Agent 1 can SearXNG tool nhung SEARXNG chua bat")
+    if not search_tool_enabled():
+        logger.error("Agent 1 can web search tool nhung WEB_SEARCH/SEARXNG chua bat")
         return []
 
     messages: List[Dict[str, str]] = [
@@ -1081,7 +1409,7 @@ async def research_topic(
                 f"Nhom: {group}\n"
                 f"Rolling 12-hour window gio VN: {format_range(start, end)}\n"
                 f"Ngay ket thuc: {end.strftime('%Y-%m-%d')}\n"
-                "Hay tu lap query va dung tool searxng_search. "
+                "Hay tu lap query va dung tool web_search. "
                 "Sau khi co observation, refine/retry neu can, roi final structured research package."
             ),
         },
@@ -1135,7 +1463,7 @@ async def research_topic(
                     observed_articles.extend(tool_articles)
                     observed_articles = merge_unique_articles(observed_articles)
                     observation = {
-                        "tool": "searxng_search",
+                        "tool": "web_search",
                         "query": query,
                         "window": format_range(start, end),
                         "result_count": len(tool_articles),
@@ -1143,10 +1471,10 @@ async def research_topic(
                     }
                 else:
                     observation = {
-                        "tool": "searxng_search",
+                        "tool": "web_search",
                         "query": query,
                         "window": format_range(start, end),
-                        "error": "SearXNG tool failed or disabled",
+                        "error": "Web search tool failed or disabled",
                         "results": [],
                     }
 
@@ -1772,9 +2100,10 @@ async def cmd_status(ctx: commands.Context):
     embed.add_field(name="Researcher",     value=f"`{RESEARCH_MODEL}`",                        inline=True)
     embed.add_field(name="Editor",         value=f"`{EDITOR_MODEL}`",                          inline=True)
     embed.add_field(name="Research API",   value=RESEARCH_API_BASE or "Chua dat",              inline=False)
-    embed.add_field(name="Agent 1 Flow",   value="Tool-using researcher -> SearXNG",           inline=False)
+    embed.add_field(name="Agent 1 Flow",   value="Tool-using researcher -> Web Search",        inline=False)
+    embed.add_field(name="Web Search",     value="ON" if WEB_SEARCH_ENABLED else "OFF",        inline=True)
+    embed.add_field(name="SearXNG Fallback", value="ON" if SEARXNG_ENABLED else "OFF",         inline=True)
     embed.add_field(name="Tavily",         value="Legacy" if TAVILY_ENABLED else "OFF",        inline=True)
-    embed.add_field(name="SearXNG Tool",   value="ON" if SEARXNG_ENABLED else "OFF",           inline=True)
     await ctx.send(embed=embed, allowed_mentions=NO_MENTIONS)
 
 
@@ -1853,15 +2182,16 @@ if __name__ == "__main__":
         raise SystemExit("Thieu RESEARCH_API_KEY (hoac API_KEY) trong .env")
     if not RESEARCH_MODEL:
         raise SystemExit("Thieu RESEARCH_MODEL (hoac MODEL_NAME) trong .env")
-    if not SEARXNG_ENABLED:
-        raise SystemExit("Thieu SEARXNG_BASE_URL hoac SEARXNG_ENABLED dang OFF; Agent 1 can SearXNG tool")
+    if not search_tool_enabled():
+        raise SystemExit("Thieu WEB_SEARCH_API_BASE/WEB_SEARCH_API_KEY hoac SEARXNG_BASE_URL; Agent 1 can web search tool")
     if not EDITOR_API_BASE:   # FIX J
         raise SystemExit("Thieu EDITOR_API_BASE (hoac API_BASE) trong .env")
     if not EDITOR_API_KEY:    # FIX J
         raise SystemExit("Thieu EDITOR_API_KEY (hoac API_KEY) trong .env")
 
-    logger.info("Agent 1 flow: RESEARCH_MODEL -> SearXNG tool -> structured package")
+    logger.info("Agent 1 flow: RESEARCH_MODEL -> web_search tool -> structured package")
+    logger.info("Web search compatible endpoint: %s", "ON" if WEB_SEARCH_ENABLED else "OFF")
     logger.info("Tavily legacy backend: %s", "ON" if TAVILY_ENABLED else "OFF")
-    logger.info("SearXNG tool: %s", "ON" if SEARXNG_ENABLED else "OFF")
+    logger.info("SearXNG fallback: %s", "ON" if SEARXNG_ENABLED else "OFF")
     logger.info("Starting Multi-Agent News Bot...")
     bot.run(DISCORD_TOKEN)
