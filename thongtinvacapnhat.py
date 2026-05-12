@@ -1,11 +1,31 @@
+"""
+AI Multi-Agent News Bot — Patched
+==================================
+Fixes applied (from review):
+ A. State lưu YYYY-MM-DD-HH thay vì chỉ slot → đúng qua ngày
+ B. Scheduler chờ mốc tiếp theo TRƯỚC, không gửi ngay khi restart
+ C. Anti-dup chỉ lưu hash bài thật sự được judge chọn
+ D. sent_urls lưu list có thứ tự, cắt đúng entry mới nhất
+ E. JSON parser robust: strip fence + regex tìm [ ] / { }
+ F. Validate schema article trước khi gửi judge
+ G. Normalize URL bỏ tracking params (utm_*, fbclid, gclid)
+ H. safe_text() escape mọi mention Discord + @channel
+ I. ssl=False bỏ, dùng default TLS verify
+ J. Check EDITOR env khi startup
+ K. asyncio.create_task thay bot.loop.create_task (discord.py mới)
+ L. Recursive retry → iterative loop
+"""
+
 import asyncio
 import hashlib
 import json
 import logging
 import os
+import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import aiohttp
 import discord
@@ -33,11 +53,22 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0") or 0)
+CHANNEL_ID    = int(os.getenv("CHANNEL_ID", "0") or 0)
 
-API_BASE = os.getenv("API_BASE", "").rstrip("/")
-API_KEY = os.getenv("API_KEY", "").strip()
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini").strip()
+# Agent 1 — Researcher (model rẻ, nhanh)
+RESEARCH_API_BASE = os.getenv("RESEARCH_API_BASE", os.getenv("API_BASE", "")).rstrip("/")
+RESEARCH_API_KEY  = os.getenv("RESEARCH_API_KEY",  os.getenv("API_KEY", "")).strip()
+RESEARCH_MODEL    = os.getenv("RESEARCH_MODEL",    os.getenv("MODEL_NAME", "")).strip()
+
+# Agent 2 — Judge/Editor (model mạnh)
+EDITOR_API_BASE   = os.getenv("EDITOR_API_BASE",  RESEARCH_API_BASE).rstrip("/")
+EDITOR_API_KEY    = os.getenv("EDITOR_API_KEY",   RESEARCH_API_KEY).strip()
+EDITOR_MODEL      = os.getenv("EDITOR_MODEL",     RESEARCH_MODEL).strip()
+
+# Tavily — Web Search API cho AI Agent (primary research nếu có key)
+TAVILY_API_KEY   = os.getenv("TAVILY_API_KEY", "").strip()
+TAVILY_API_BASE  = os.getenv("TAVILY_API_BASE", "https://api.tavily.com").rstrip("/")
+TAVILY_ENABLED   = bool(TAVILY_API_KEY) and os.getenv("TAVILY_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 # =========================================================
 # CONFIG
@@ -45,210 +76,318 @@ MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini").strip()
 
 class Config:
     SEARCH_INTERVAL_HOURS = 6
-    MAX_RETRIES = 5
-    RETRY_DELAY = 2
-    REQUEST_TIMEOUT = 180
+    MAX_RETRIES           = 5
+    RETRY_DELAY           = 2
+    REQUEST_TIMEOUT       = 600
 
-    MAX_PARALLEL_REQUESTS = 20
-    MAX_DISCORD_LENGTH = 1900
-    DISCORD_DELAY = 0.4
+    MAX_PARALLEL_RESEARCH = 35
+    MAX_PLAIN_TEXT        = 1900
+    DISCORD_DELAY         = 0.4
 
-    TIMEZONE_OFFSET = 7
-    CACHE_EXPIRE = 3600
+    TIMEZONE_OFFSET       = 7
+    CACHE_EXPIRE          = 3600
+    CACHE_CLEANUP_INTERVAL = 3600
 
-    TCP_LIMIT = 100
-    DNS_CACHE = 300
+    TCP_LIMIT             = 100
+    DNS_CACHE             = 300
 
-    MAX_TOKENS = 1800
-    STATE_FILE = "bot_state.json"
-    SLOTS = [0, 6, 12, 18]
+    RESEARCH_MAX_TOKENS   = 1200
+    EDITOR_MAX_TOKENS     = 2000
+
+    STATE_FILE            = "bot_state.json"
+    SENT_URLS_FILE        = "sent_urls.json"
+    SENT_URLS_MAX         = 2000
+
+    SLOTS                 = [0, 6, 12, 18]
+    SCHEDULER_RETRY_DELAY = 300
+    SCHEDULER_SLOT_MAX_RETRIES = int(os.getenv("SCHEDULER_SLOT_MAX_RETRIES", "3") or 3)
+    BACKGROUND_TASK_RESTART_DELAY = 30
+
+    TAVILY_MAX_RESULTS    = int(os.getenv("TAVILY_MAX_RESULTS", "4") or 4)
+    TAVILY_SEARCH_DEPTH   = os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip() or "basic"
+
+    # Tracking params cần loại bỏ khi normalize URL
+    TRACKING_PARAMS = {
+        "utm_source", "utm_medium", "utm_campaign", "utm_term",
+        "utm_content", "utm_id", "fbclid", "gclid", "msclkid",
+        "ref", "source", "_ga",
+    }
 
 # =========================================================
-# TOPICS
+# TOPIC GROUPS
 # =========================================================
 
 TOPIC_GROUPS: Dict[str, List[str]] = {
-    "🤖 AI & Công Nghệ": [
+    "🤖 AI & Cong Nghe": [
         "AI news worldwide",
-        "OpenAI news",
-        "ChatGPT updates",
-        "Claude AI",
-        "Gemini AI",
+        "OpenAI ChatGPT updates",
+        "Claude AI Anthropic",
+        "Gemini AI Google",
         "DeepSeek AI",
-        "AI agents",
-        "AI automation",
-        "machine learning",
+        "AI agents automation",
         "LLM breakthrough",
         "robotics AI",
-        "cybersecurity AI",
-        "NVIDIA AI",
-        "AMD AI",
-        "Intel AI",
-        "Apple news",
-        "Google news",
-        "Microsoft news",
+        "cybersecurity incident",
+        "NVIDIA AMD Intel AI",
+        "Apple Google Microsoft news",
         "Samsung technology",
-        "Linux news",
-        "Windows update",
-        "cloud computing",
-        "datacenter technology",
-        "quantum computing",
-        "SpaceX news",
-        "NASA news",
-        "science breakthrough",
-        "Việt Nam AI",
-        "Việt Nam công nghệ",
-        "Việt Nam startup công nghệ",
-        "Việt Nam an ninh mạng",
+        "Linux Windows update",
+        "cloud quantum computing",
+        "SpaceX NASA news",
+        "Viet Nam AI cong nghe",
+        "Viet Nam startup an ninh mang",
     ],
     "🎮 Gaming": [
         "gaming news",
-        "Steam game news",
-        "PlayStation news",
-        "Xbox news",
-        "Nintendo news",
-        "gacha game news",
+        "Steam PlayStation Xbox Nintendo",
+        "gacha game Genshin Honkai",
         "Wuthering Waves news",
-        "Genshin Impact news",
-        "Honkai Star Rail news",
-        "Esports news",
-        "VCS LMHT",
+        "Esports VCS LMHT",
     ],
     "📈 Crypto & Finance": [
-        "Bitcoin news",
-        "Ethereum news",
-        "crypto market",
-        "DeFi news",
-        "VN-Index",
-        "stock market news",
-        "global economy",
-        "gold price",
-        "USD exchange rate",
+        "Bitcoin Ethereum news",
+        "crypto DeFi market",
+        "VN-Index chung khoan",
+        "stock market global",
+        "gold USD exchange rate",
     ],
     "⚽ Sports": [
-        "football news",
-        "Premier League",
-        "Champions League",
-        "transfer news",
+        "Premier League Champions League",
+        "transfer news football",
         "Vietnam football",
         "Esports tournament",
     ],
     "🎬 Entertainment": [
-        "Netflix releases",
-        "Hollywood news",
-        "Disney movie news",
-        "celebrity news",
-        "KDrama news",
-        "Kpop news",
+        "Netflix Hollywood Disney news",
+        "celebrity KDrama Kpop",
         "music industry news",
+        "Viet Nam phim giai tri",
     ],
     "⛩️ Anime & Manga": [
-        "anime news",
-        "manga news",
-        "One Piece news",
-        "Jujutsu Kaisen news",
-        "anime adaptation",
-        "light novel adaptation",
+        "anime manga news 2026",
+        "One Piece Jujutsu Kaisen",
+        "anime adaptation light novel",
         "Japanese anime industry",
     ],
     "🏥 Health": [
-        "health news",
-        "medical breakthrough",
-        "virus outbreak",
-        "fitness trend",
-        "nutrition research",
-        "longevity research",
+        "medical breakthrough virus",
+        "fitness nutrition longevity",
+        "Viet Nam y te suc khoe",
     ],
-    "🇻🇳 Việt Nam": [
-        "Việt Nam kinh tế",
-        "Việt Nam giáo dục",
-        "Việt Nam pháp luật",
-        "Việt Nam môi trường",
-        "Việt Nam giao thông",
-        "Việt Nam y tế",
-        "Hà Nội tin mới",
-        "TP HCM tin mới",
+    "🇻🇳 Viet Nam": [
+        "Viet Nam kinh te giao duc",
+        "Viet Nam phap luat moi truong",
+        "Ha Noi TP HCM tin moi",
+        "Viet Nam giao thong y te",
     ],
 }
 
 GROUP_COLORS: Dict[str, int] = {
-    "🤖 AI & Công Nghệ": 0x00CFFF,
-    "🎮 Gaming": 0x9966FF,
-    "📈 Crypto & Finance": 0xF7D000,
-    "⚽ Sports": 0x44FF88,
-    "🎬 Entertainment": 0xFF9900,
-    "⛩️ Anime & Manga": 0xFF69B4,
-    "🏥 Health": 0x88FFCC,
-    "🇻🇳 Việt Nam": 0xFF4444,
+    "🤖 AI & Cong Nghe":   0x00CFFF,
+    "🎮 Gaming":            0x9966FF,
+    "📈 Crypto & Finance":  0xF7D000,
+    "⚽ Sports":             0x44FF88,
+    "🎬 Entertainment":     0xFF9900,
+    "⛩️ Anime & Manga":    0xFF69B4,
+    "🏥 Health":            0x88FFCC,
+    "🇻🇳 Viet Nam":         0xFF4444,
 }
 
 # =========================================================
-# DISCORD
+# DISCORD BOT
 # =========================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+NO_MENTIONS = discord.AllowedMentions.none()
 
 # =========================================================
 # GLOBALS
 # =========================================================
 
 CACHE: Dict[str, Dict[str, Any]] = {}
-semaphore = asyncio.Semaphore(Config.MAX_PARALLEL_REQUESTS)
-last_sent_slot = -1
-scheduler_started = False
+VN_TZ = timezone(timedelta(hours=Config.TIMEZONE_OFFSET))
+research_semaphore = asyncio.Semaphore(Config.MAX_PARALLEL_RESEARCH)
+state_lock         = asyncio.Lock()
+sent_urls_lock     = asyncio.Lock()
+digest_lock        = asyncio.Lock()
+last_sent_key      = ""          # FIX A: lưu "YYYY-MM-DD-HH" thay vì chỉ slot int
+last_processed_key = ""          # mốc cuối đã gửi thành công hoặc đã bỏ qua sau retry limit
+scheduler_started  = False
+cache_cleanup_started = False
 
 # =========================================================
 # TIME HELPERS
 # =========================================================
 
 def vn_now() -> datetime:
-    return datetime.utcnow() + timedelta(hours=Config.TIMEZONE_OFFSET)
+    return datetime.now(timezone.utc).astimezone(VN_TZ)
 
 def format_range(start: datetime, end: datetime) -> str:
-    return f"{start.strftime('%H:%M %d/%m/%Y')} → {end.strftime('%H:%M %d/%m/%Y')}"
+    return f"{start.strftime('%H:%M %d/%m/%Y')} -> {end.strftime('%H:%M %d/%m/%Y')}"
 
-def current_slot() -> int:
-    hour = vn_now().hour
+def slot_for(dt: datetime) -> int:
+    """Tính slot từ chính dt, không dùng clock hiện tại."""
+    hour = dt.hour
     for slot in reversed(Config.SLOTS):
         if hour >= slot:
             return slot
-    return 18
+    return Config.SLOTS[-1]
 
-def next_slot_time() -> datetime:
-    now = vn_now()
-    cur = current_slot()
-    for slot in Config.SLOTS:
-        if slot > cur:
-            return now.replace(hour=slot, minute=0, second=0, microsecond=0)
-    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+def current_slot() -> int:
+    return slot_for(vn_now())
+
+def slot_start_time(dt: Optional[datetime] = None) -> datetime:
+    dt = dt or vn_now()
+    slot = slot_for(dt)
+    return dt.replace(hour=slot, minute=0, second=0, microsecond=0)
+
+def slot_key(dt: Optional[datetime] = None) -> str:
+    """Key dạng YYYY-MM-DD-HH, slot tính từ dt truyền vào."""
+    return slot_start_time(dt or vn_now()).strftime("%Y-%m-%d-%H")
+
+def parse_slot_key(key: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(key, "%Y-%m-%d-%H").replace(tzinfo=VN_TZ)
+    except Exception:
+        return None
+
+def next_slot_after(dt: datetime) -> datetime:
+    for slot in sorted(Config.SLOTS):
+        candidate = dt.replace(hour=slot, minute=0, second=0, microsecond=0)
+        if candidate > dt:
+            return candidate
+    return (dt + timedelta(days=1)).replace(
+        hour=sorted(Config.SLOTS)[0],
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+def next_slot_time(dt: Optional[datetime] = None) -> datetime:
+    return next_slot_after(dt or vn_now())
+
+def pending_slot_times(last_key: str, now: Optional[datetime] = None) -> List[datetime]:
+    now = now or vn_now()
+    current = slot_start_time(now)
+    last_dt = parse_slot_key(last_key)
+    if last_dt is None:
+        return [current]
+
+    due: List[datetime] = []
+    candidate = next_slot_after(last_dt)
+    while candidate <= current:
+        due.append(candidate)
+        candidate = next_slot_after(candidate)
+    return due
 
 async def wait_until_next_slot() -> None:
-    nxt = next_slot_time()
+    nxt     = next_slot_time()
     seconds = max((nxt - vn_now()).total_seconds(), 0)
-    logger.info("Waiting %.0fs", seconds)
+    logger.info("Waiting %.0fs until %s", seconds, nxt.strftime("%H:%M"))
     await asyncio.sleep(seconds)
 
 # =========================================================
-# STATE
+# PERSISTENT STATE  (FIX A)
 # =========================================================
 
+def atomic_write_json(path: str, data: Any) -> None:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
 def load_state() -> None:
-    global last_sent_slot
+    global last_sent_key, last_processed_key
     try:
         with open(Config.STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            last_sent_slot = int(data.get("last_sent_slot", -1))
+            last_sent_key = str(data.get("last_sent_key", ""))
+            last_processed_key = str(data.get("last_processed_key", last_sent_key))
     except Exception:
-        last_sent_slot = -1
+        last_sent_key = ""
+        last_processed_key = ""
 
 def save_state() -> None:
     try:
-        with open(Config.STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"last_sent_slot": last_sent_slot}, f)
+        atomic_write_json(
+            Config.STATE_FILE,
+            {
+                "last_sent_key": last_sent_key,
+                "last_processed_key": last_processed_key or last_sent_key,
+            },
+        )
     except Exception as e:
-        logger.error("Lỗi lưu state: %s", e)
+        logger.error("Loi luu state: %s", e)
+
+# =========================================================
+# ANTI-DUPLICATE MEMORY  (FIX C + D)
+# =========================================================
+
+def _normalize_url(url: str) -> str:
+    """FIX G: bỏ tracking params trước khi hash."""
+    try:
+        parsed = urlparse(url.strip())
+        qs     = parse_qs(parsed.query, keep_blank_values=False)
+        clean  = {k: v for k, v in qs.items() if k.lower() not in Config.TRACKING_PARAMS}
+        new_query = urlencode(clean, doseq=True)
+        return urlunparse(parsed._replace(query=new_query)).lower()
+    except Exception:
+        return url.strip().lower()
+
+def _url_hash(url: str) -> str:
+    return hashlib.md5(_normalize_url(url).encode()).hexdigest()
+
+def load_sent_urls() -> list:
+    """Trả list (có thứ tự) thay vì set — FIX D."""
+    try:
+        with open(Config.SENT_URLS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return list(data) if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def save_sent_urls(hashes: list) -> None:
+    """Giữ SENT_URLS_MAX entry mới nhất (cuối list = mới nhất). FIX D."""
+    trimmed = hashes[-Config.SENT_URLS_MAX:]
+    try:
+        atomic_write_json(Config.SENT_URLS_FILE, trimmed)
+    except Exception as e:
+        logger.error("Loi luu sent_urls: %s", e)
+
+def filter_new_articles(
+    articles: List[Dict[str, Any]],
+    sent_set: set,
+) -> List[Dict[str, Any]]:
+    new_articles: List[Dict[str, Any]] = []
+    for art in articles:
+        url = art.get("url", "")
+        key = url if url else art.get("title", str(art))
+        h = _url_hash(key)
+        if h not in sent_set:
+            sent_set.add(h)
+            new_articles.append(art)
+    return new_articles
+
+def extract_sent_hashes_from_judged(judged: Dict[str, Any]) -> List[str]:
+    """FIX C: chỉ hash bài nằm trong judged["groups"] — bài thật sự được chọn."""
+    hashes: List[str] = []
+    groups = judged.get("groups", {})
+    if not isinstance(groups, dict):
+        return hashes
+    for articles in groups.values():
+        if not isinstance(articles, list):
+            continue
+        for art in articles:
+            if not isinstance(art, dict):
+                continue
+            url   = art.get("url", "")
+            title = art.get("title", "")
+            key   = url or title
+            if key:
+                hashes.append(_url_hash(key))
+    return hashes
 
 # =========================================================
 # CACHE
@@ -256,309 +395,767 @@ def save_state() -> None:
 
 def make_cache_key(topic: str, start: datetime, end: datetime) -> str:
     raw = f"{topic}_{start.isoformat()}_{end.isoformat()}"
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+    return hashlib.md5(raw.encode()).hexdigest()
 
 def get_cache(key: str) -> Optional[str]:
     item = CACHE.get(key)
     if not item:
         return None
-    if time.time() - float(item["time"]) > Config.CACHE_EXPIRE:
+    try:
+        expired = time.time() - float(item["ts"]) > Config.CACHE_EXPIRE
+    except Exception:
+        expired = True
+    if expired:
         CACHE.pop(key, None)
         return None
     return str(item["data"])
 
 def set_cache(key: str, value: str) -> None:
-    CACHE[key] = {"time": time.time(), "data": value}
+    CACHE[key] = {"ts": time.time(), "data": value}
+
+def cleanup_cache() -> int:
+    now = time.time()
+    expired = []
+    for key, item in list(CACHE.items()):
+        try:
+            if now - float(item.get("ts", 0)) > Config.CACHE_EXPIRE:
+                expired.append(key)
+        except Exception:
+            expired.append(key)
+    for key in expired:
+        CACHE.pop(key, None)
+    return len(expired)
+
+async def cache_cleanup_loop() -> None:
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            removed = cleanup_cache()
+            if removed:
+                logger.info("Cache cleanup: xoa %d muc het han", removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Cache cleanup loop loi")
+        await asyncio.sleep(Config.CACHE_CLEANUP_INTERVAL)
 
 # =========================================================
-# RESPONSE PARSER
+# JSON PARSER ROBUST  (FIX E)
+# =========================================================
+
+def strip_json_fence(raw: str) -> str:
+    """Bỏ markdown code fence, trả raw text."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        # lấy nội dung giữa hai fence
+        parts = raw.split("```")
+        raw   = parts[1] if len(parts) >= 2 else raw
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+    return raw.strip()
+
+def extract_first_json_value(raw: str, start_chars: str, expected_type: type) -> Optional[Any]:
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(raw):
+        if ch not in start_chars:
+            continue
+        try:
+            value, _ = decoder.raw_decode(raw[i:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, expected_type):
+            return value
+    return None
+
+def extract_json_array(raw: str) -> Optional[list]:
+    """Tìm JSON array đầu tiên trong chuỗi, ngay cả khi có text thừa."""
+    raw = strip_json_fence(raw)
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else None
+    except Exception:
+        pass
+    parsed = extract_first_json_value(raw, "[", list)
+    if isinstance(parsed, list):
+        return parsed
+    m = re.search(r"\[.*?\]", raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except Exception:
+            pass
+    return None
+
+def extract_json_object(raw: str) -> Optional[dict]:
+    """Tìm JSON object đầu tiên trong chuỗi."""
+    raw = strip_json_fence(raw)
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        pass
+    parsed = extract_first_json_value(raw, "{", dict)
+    if isinstance(parsed, dict):
+        return parsed
+    m = re.search(r"\{.*?\}", raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except Exception:
+            pass
+    return None
+
+# =========================================================
+# ARTICLE VALIDATION  (FIX F)
+# =========================================================
+
+def valid_article(art: Any) -> bool:
+    """Bài hợp lệ phải có title + summary tối thiểu."""
+    return (
+        isinstance(art, dict)
+        and bool(art.get("title", "").strip())
+        and bool(art.get("summary", "").strip())
+    )
+
+# =========================================================
+# TEXT SANITIZER  (FIX H)
+# =========================================================
+
+def safe_text(s: Any) -> str:
+    """Escape mọi mention Discord để bot không ping server/user/role."""
+    escaped = discord.utils.escape_mentions(str(s))
+    return re.sub(r"@(?=channel\b)", "@\u200b", escaped, flags=re.IGNORECASE)
+
+# =========================================================
+# STREAMING / JSON RESPONSE PARSER
 # =========================================================
 
 async def parse_openai_response(resp: aiohttp.ClientResponse) -> Dict[str, Any]:
-    content_type = resp.headers.get("Content-Type", "").lower()
-    logger.info("Content-Type: %s", content_type)
+    ct = resp.headers.get("Content-Type", "").lower()
 
-    if "application/json" in content_type:
+    if "application/json" in ct:
         return await resp.json()
 
-    if "text/event-stream" in content_type:
+    if "text/event-stream" in ct:
         full_text = ""
         async for raw_line in resp.content:
             try:
                 line = raw_line.decode("utf-8", errors="ignore").strip()
             except Exception:
                 continue
-
             if not line or not line.startswith("data:"):
                 continue
-
             data_str = line[5:].strip()
             if data_str == "[DONE]":
                 break
-
             try:
-                chunk = json.loads(data_str)
+                chunk   = json.loads(data_str)
                 choices = chunk.get("choices", [])
                 if not choices:
                     continue
-                choice = choices[0]
-                delta = choice.get("delta", {}).get("content")
+                delta = choices[0].get("delta", {}).get("content")
                 if delta is None:
-                    delta = choice.get("message", {}).get("content", "")
+                    delta = choices[0].get("message", {}).get("content", "")
                 if delta:
                     full_text += delta
             except Exception:
                 continue
-
         return {"choices": [{"message": {"content": full_text}}]}
 
     text = await resp.text()
-    raise RuntimeError(f"Unsupported Content-Type: {content_type}\n{text[:300]}")
+    raise RuntimeError(f"Unsupported Content-Type: {ct}\n{text[:300]}")
 
 # =========================================================
-# API CALL
+# GENERIC API CALL — iterative retry  (FIX L)
 # =========================================================
 
-async def make_api_call(
+async def _api_call(
     session: aiohttp.ClientSession,
+    api_base: str,
+    api_key: str,
+    model: str,
     messages: List[Dict[str, str]],
-    retry: int = 0,
+    max_tokens: int,
 ) -> Optional[Dict[str, Any]]:
-    async with semaphore:
+    """Iterative retry với exponential backoff — không đệ quy."""
+    for attempt in range(Config.MAX_RETRIES + 1):
         try:
-            payload = {
-                "model": MODEL_NAME,
-                "messages": messages,
-                "temperature": 0.4,
-                "max_tokens": Config.MAX_TOKENS,
-                "stream": False,
-            }
-
             async with session.post(
-                f"{API_BASE}/chat/completions",
+                f"{api_base}/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {API_KEY}",
-                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type":  "application/json",
                 },
-                json=payload,
+                json={
+                    "model":       model,
+                    "messages":    messages,
+                    "temperature": 0.3,
+                    "max_tokens":  max_tokens,
+                    "stream":      False,
+                },
                 timeout=aiohttp.ClientTimeout(
                     total=Config.REQUEST_TIMEOUT,
                     sock_read=Config.REQUEST_TIMEOUT,
                 ),
             ) as resp:
                 if resp.status in {429, 500, 502, 503, 504}:
-                    if retry < Config.MAX_RETRIES:
-                        delay = Config.RETRY_DELAY * (2**retry)
+                    if attempt < Config.MAX_RETRIES:
+                        delay = Config.RETRY_DELAY * (2 ** attempt)
                         logger.warning(
-                            "Retry %s/%s sau %.1fs — status %s",
-                            retry + 1,
-                            Config.MAX_RETRIES,
-                            delay,
-                            resp.status,
+                            "Retry %s/%s sau %.1fs (HTTP %s)",
+                            attempt + 1, Config.MAX_RETRIES, delay, resp.status,
                         )
                         await asyncio.sleep(delay)
-                        return await make_api_call(session, messages, retry + 1)
-                    logger.error("Hết retry sau %s lần (status %s)", Config.MAX_RETRIES, resp.status)
+                        continue
+                    logger.error("Het retry (HTTP %s)", resp.status)
                     return None
 
                 if resp.status != 200:
-                    logger.error("API Error %s: %s", resp.status, await resp.text())
+                    logger.error("API %s: %s", resp.status, await resp.text())
                     return None
 
                 return await parse_openai_response(resp)
 
         except asyncio.TimeoutError:
-            logger.warning("Timeout retry %s/%s", retry + 1, Config.MAX_RETRIES)
-            if retry < Config.MAX_RETRIES:
-                await asyncio.sleep(Config.RETRY_DELAY * (2**retry))
-                return await make_api_call(session, messages, retry + 1)
-            return None
+            if attempt < Config.MAX_RETRIES:
+                delay = Config.RETRY_DELAY * (2 ** attempt)
+                logger.warning("Timeout retry %s/%s sau %.1fs", attempt + 1, Config.MAX_RETRIES, delay)
+                await asyncio.sleep(delay)
+            else:
+                logger.error("Het retry do timeout")
+                return None
+
         except Exception as e:
-            logger.error("API Error: %s", e)
-            if retry < Config.MAX_RETRIES:
-                await asyncio.sleep(Config.RETRY_DELAY * (2**retry))
-                return await make_api_call(session, messages, retry + 1)
-            return None
+            if attempt < Config.MAX_RETRIES:
+                delay = Config.RETRY_DELAY * (2 ** attempt)
+                logger.warning("Loi API retry %s/%s: %s", attempt + 1, Config.MAX_RETRIES, e)
+                await asyncio.sleep(delay)
+            else:
+                logger.error("Het retry: %s", e)
+                return None
+
+    return None
 
 # =========================================================
-# TOPIC SEARCH
+# TAVILY SEARCH
 # =========================================================
 
-async def search_topic(
+def source_from_url(url: str) -> str:
+    try:
+        return urlparse(url).netloc.replace("www.", "") or "Tavily"
+    except Exception:
+        return "Tavily"
+
+def importance_from_score(score: Any) -> int:
+    try:
+        value = float(score)
+        if 0 <= value <= 1:
+            value *= 100
+        return max(0, min(100, int(value)))
+    except Exception:
+        return 50
+
+async def tavily_search_topic(
     session: aiohttp.ClientSession,
     topic: str,
+    group: str,
     start: datetime,
     end: datetime,
-) -> str:
-    cache_key = make_cache_key(topic, start, end)
-    cached = get_cache(cache_key)
-    if cached:
-        return cached
+) -> Optional[List[Dict[str, Any]]]:
+    if not TAVILY_ENABLED:
+        return None
 
-    time_range = format_range(start, end)
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Bạn là AI tổng hợp tin tức. Trả lời tiếng Việt. "
-                "Chỉ nêu 2-3 tin nổi bật nhất, ngắn gọn, rõ ràng, markdown đẹp."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"""
-Tìm tin mới nhất về chủ đề: {topic}
-
-Khung thời gian (giờ Việt Nam): {time_range}
-
-Yêu cầu:
-- 2-3 tin nổi bật
-- Mỗi tin gồm: tiêu đề, tóm tắt 2 câu, link nguồn
-- Nếu không có tin phù hợp, trả về đúng chuỗi: KHÔNG CÓ TIN
-""".strip(),
-        },
-    ]
-
-    result = await make_api_call(session, messages)
-    if not result:
-        return ""
-
-    try:
-        content = result["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return ""
-
-    if "KHÔNG CÓ TIN" in content or len(content) < 50:
-        return ""
-
-    set_cache(cache_key, content)
-    return content
-
-# =========================================================
-# BUILD DIGEST
-# =========================================================
-
-async def build_group_digest(
-    group_name: str,
-    topics: List[str],
-    start: datetime,
-    end: datetime,
-    session: aiohttp.ClientSession,
-) -> Dict[str, str]:
-    tasks = [search_topic(session, topic, start, end) for topic in topics]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    valid: List[str] = []
-    seen = set()
-
-    for r in results:
-        if not isinstance(r, str) or len(r) < 50:
-            continue
-        key = r[:120].lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        valid.append(r)
-
-    return {
-        "group": group_name,
-        "content": "\n\n---\n\n".join(valid),
+    days = max(1, int((end - start).total_seconds() // 86400) + 1)
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": f"{topic} latest news {end.strftime('%Y-%m-%d')}",
+        "topic": "news",
+        "search_depth": Config.TAVILY_SEARCH_DEPTH,
+        "max_results": Config.TAVILY_MAX_RESULTS,
+        "days": days,
+        "include_answer": False,
+        "include_raw_content": False,
+        "include_images": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {TAVILY_API_KEY}",
     }
 
-async def build_all_digest(start: datetime, end: datetime) -> List[Dict[str, str]]:
-    connector = aiohttp.TCPConnector(
-        limit=Config.TCP_LIMIT,
-        ttl_dns_cache=Config.DNS_CACHE,
-        ssl=False,
+    data: Optional[Dict[str, Any]] = None
+    for attempt in range(Config.MAX_RETRIES + 1):
+        try:
+            async with session.post(
+                f"{TAVILY_API_BASE}/search",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=Config.REQUEST_TIMEOUT),
+            ) as resp:
+                if resp.status in {429, 500, 502, 503, 504} and attempt < Config.MAX_RETRIES:
+                    delay = Config.RETRY_DELAY * (2 ** attempt)
+                    logger.warning("Tavily retry %s/%s sau %.1fs (HTTP %s)", attempt + 1, Config.MAX_RETRIES, delay, resp.status)
+                    await asyncio.sleep(delay)
+                    continue
+                if resp.status != 200:
+                    logger.error("Tavily API %s: %s", resp.status, (await resp.text())[:300])
+                    return None
+                data = await resp.json()
+                break
+        except Exception as e:
+            if attempt < Config.MAX_RETRIES:
+                delay = Config.RETRY_DELAY * (2 ** attempt)
+                logger.warning("Tavily loi retry %s/%s: %s", attempt + 1, Config.MAX_RETRIES, e)
+                await asyncio.sleep(delay)
+            else:
+                logger.error("Tavily het retry: %s", e)
+                return None
+
+    if not isinstance(data, dict):
+        return None
+
+    articles: List[Dict[str, Any]] = []
+    for item in data.get("results", []):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        url = str(item.get("url", "")).strip()
+        summary = str(item.get("content") or item.get("snippet") or "").strip()
+        if item.get("published_date"):
+            summary = f"{summary}\nNgay dang: {item.get('published_date')}".strip()
+        art = {
+            "title": title,
+            "summary": summary,
+            "url": url,
+            "source": str(item.get("source") or source_from_url(url)).strip(),
+            "topic": topic,
+            "importance": importance_from_score(item.get("score", 0.5)),
+            "_group": group,
+        }
+        if valid_article(art):
+            articles.append(art)
+
+    logger.info("Tavily: %s -> %d ket qua", topic, len(articles))
+    return articles
+
+# =========================================================
+# AGENT 1 — RESEARCHER
+# =========================================================
+
+RESEARCHER_SYSTEM = """Ban la AI chuyen thu thap tin tuc.
+
+Nhiem vu:
+- Doc yeu cau chu de va khung thoi gian
+- Tim 2-4 tin MOI NHAT, noi bat nhat
+- Output CHI la JSON array, khong co markdown, khong co text thua
+
+Format JSON bat buoc:
+[
+  {
+    "title": "Tieu de tin (tieng Viet)",
+    "summary": "Tom tat 2 cau ngan gon bang tieng Viet.",
+    "url": "https://...",
+    "source": "Ten nguon bao",
+    "topic": "Ten chu de",
+    "importance": 75
+  }
+]
+
+importance: 0-100, danh gia so bo muc do quan trong.
+Neu khong co tin phu hop, tra ve: []"""
+
+
+async def research_topic(
+    session: aiohttp.ClientSession,
+    topic: str,
+    group: str,
+    start: datetime,
+    end: datetime,
+) -> List[Dict[str, Any]]:
+    """Agent 1: search 1 topic → list bài thô (JSON validated)."""
+    cache_key = make_cache_key(f"research_{topic}", start, end)
+    cached    = get_cache(cache_key)
+    if cached:
+        try:
+            data = json.loads(cached)
+            if isinstance(data, list):
+                return data
+        except Exception as e:
+            logger.warning("Cache research bi hong topic=%s: %s", topic, e)
+
+    async with research_semaphore:
+        tavily_articles = await tavily_search_topic(session, topic, group, start, end)
+        if tavily_articles is not None:
+            if tavily_articles:
+                set_cache(cache_key, json.dumps(tavily_articles, ensure_ascii=False))
+            return tavily_articles
+
+        if not RESEARCH_API_BASE or not RESEARCH_API_KEY:
+            logger.warning("Bo qua researcher fallback vi thieu RESEARCH_API_BASE/RESEARCH_API_KEY")
+            return []
+
+        result = await _api_call(
+            session,
+            RESEARCH_API_BASE,
+            RESEARCH_API_KEY,
+            RESEARCH_MODEL,
+            messages=[
+                {"role": "system", "content": RESEARCHER_SYSTEM},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Chu de: {topic}\n"
+                        f"Khung thoi gian (gio VN): {format_range(start, end)}\n"
+                        "Hay tim tin moi nhat va tra ve JSON array."
+                    ),
+                },
+            ],
+            max_tokens=Config.RESEARCH_MAX_TOKENS,
+        )
+
+    if not result:
+        return []
+
+    raw      = result["choices"][0]["message"]["content"]
+    articles = extract_json_array(raw)  # FIX E
+
+    if not isinstance(articles, list):
+        return []
+
+    # FIX F: validate schema, gắn nhóm
+    valid = []
+    for art in articles:
+        if valid_article(art):
+            art["_group"] = group
+            valid.append(art)
+
+    if valid:
+        set_cache(cache_key, json.dumps(valid))
+
+    return valid
+
+# =========================================================
+# AGENT 2 — JUDGE / EDITOR
+# =========================================================
+
+EDITOR_SYSTEM = """Ban la Tong bien tap tin tuc AI.
+
+Nhiem vu:
+- Doc danh sach bai bao tho tu nhieu chu de (truong _group cho biet nhom)
+- Danh gia tung bai theo 4 tieu chi: viral(0-100), impact(0-100), interesting(0-100), trustworthy(0-100)
+- Tinh final_score = (viral*0.3 + impact*0.3 + interesting*0.25 + trustworthy*0.15)
+- Loai bo: tin trung noi dung, clickbait, spam, quang cao, tin co final_score < 40
+- Chon top 3 tin tot nhat moi nhom (dua theo truong _group)
+- GIU NGUYEN url, title tu input (tuyet doi khong bia dat URL)
+- summary co the viet lai ngan gon hon bang tieng Viet
+
+Output CHI la JSON object, tuyet doi khong co text thua ben ngoai:
+{
+  "groups": {
+    "Ten nhom": [
+      {
+        "title": "...",
+        "summary": "Tom tat 2-3 cau tieng Viet.",
+        "url": "https://...",
+        "source": "...",
+        "final_score": 87,
+        "tags": ["Viral", "AI"]
+      }
+    ]
+  },
+  "highlight": "Mo ta 1 cau ve tin noi bat nhat toan bo digest."
+}
+
+Tags goi y (chon 1-3): Viral, AI, Canh bao, Moi, Game, Tai chinh, The gioi, Viet Nam, Suc khoe, Phim"""
+
+
+async def judge_news(
+    session: aiohttp.ClientSession,
+    raw_articles: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Agent 2: nhận list bài thô → ranked JSON đã filter."""
+    if not raw_articles:
+        return None
+
+    result = await _api_call(
+        session,
+        EDITOR_API_BASE,
+        EDITOR_API_KEY,
+        EDITOR_MODEL,
+        messages=[
+            {"role": "system", "content": EDITOR_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    f"Co {len(raw_articles)} bai bao tho duoi day.\n"
+                    "Hay danh gia, loc va tra ve JSON chuan:\n\n"
+                    + json.dumps(raw_articles, ensure_ascii=False)
+                ),
+            },
+        ],
+        max_tokens=Config.EDITOR_MAX_TOKENS,
     )
 
+    if not result:
+        return None
+
+    raw    = result["choices"][0]["message"]["content"]
+    judged = extract_json_object(raw)  # FIX E
+
+    if not isinstance(judged, dict) or "groups" not in judged:
+        logger.error("Judge tra ve sai schema. Raw: %s", raw[:300])
+        return None
+
+    return judged
+
+# =========================================================
+# FULL PIPELINE: collect → filter → judge
+# =========================================================
+
+async def collect_news(start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    """Agent 1: chạy song song tất cả topics."""
+    connector = aiohttp.TCPConnector(   # FIX I: bỏ ssl=False
+        limit=Config.TCP_LIMIT,
+        ttl_dns_cache=Config.DNS_CACHE,
+    )
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [
-            build_group_digest(group, topics, start, end, session)
-            for group, topics in TOPIC_GROUPS.items()
-        ]
+        flat    = [(g, t) for g, topics in TOPIC_GROUPS.items() for t in topics]
+        tasks   = [research_topic(session, t, g, start, end) for g, t in flat]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    final: List[Dict[str, str]] = []
-    for r in results:
-        if isinstance(r, dict) and r.get("content"):
-            final.append(r)
-    return final
+    all_articles: List[Dict[str, Any]] = []
+    for res in results:
+        if isinstance(res, list):
+            all_articles.extend(res)
+
+    logger.info("Agent 1: thu thap %d bai tu %d topics", len(all_articles), len(flat))
+    return all_articles
+
+
+async def run_pipeline(start: datetime, end: datetime) -> Optional[Dict[str, Any]]:
+    """Collect → anti-dup filter → judge."""
+    raw_articles = await collect_news(start, end)
+    if not raw_articles:
+        return None
+
+    async with sent_urls_lock:
+        # Lock giữ trọn read → filter/judge → write, tránh lost update giữa scheduler và !force/!news.
+        sent_list = load_sent_urls()
+        saved_sent_set = set(sent_list)
+        seen_set = set(saved_sent_set)
+
+        new_articles = filter_new_articles(raw_articles, seen_set)
+        logger.info("Bai moi chua gui: %d / %d", len(new_articles), len(raw_articles))
+
+        if not new_articles:
+            logger.info("Tat ca tin da duoc gui truoc do.")
+            return None
+
+        connector = aiohttp.TCPConnector(limit=20)  # FIX I
+        async with aiohttp.ClientSession(connector=connector) as session:
+            judged = await judge_news(session, new_articles)
+
+        if judged:
+            # FIX C: chỉ lưu hash bài thật sự được judge chọn
+            new_hashes = extract_sent_hashes_from_judged(judged)
+            appended = 0
+            # FIX D+8: append có kiểm soát, không duplicate trong batch.
+            for h in new_hashes:
+                if h not in saved_sent_set:
+                    sent_list.append(h)
+                    saved_sent_set.add(h)
+                    appended += 1
+            save_sent_urls(sent_list)
+            logger.info("Luu %d/%d hash moi vao sent_urls", appended, len(new_hashes))
+
+        return judged
 
 # =========================================================
-# MESSAGE SPLIT
+# SPLIT MESSAGE
 # =========================================================
 
-def split_message(text: str, max_len: int = Config.MAX_DISCORD_LENGTH) -> List[str]:
-    if len(text) <= max_len:
+def _inside_span(spans: List[tuple], idx: int) -> bool:
+    return any(start < idx < end for start, end in spans)
+
+def _markdown_cut_is_safe(text: str, idx: int) -> bool:
+    spans = [(m.start(), m.end()) for m in re.finditer(r"https?://\S+", text)]
+    spans.extend((m.start(), m.end()) for m in re.finditer(r"\[[^\]\n]+\]\([^)]+\)", text))
+    if _inside_span(spans, idx):
+        return False
+    if 0 < idx < len(text) and text[idx - 1] == "*" and text[idx] == "*":
+        return False
+    prefix = text[:idx]
+    return prefix.count("**") % 2 == 0 and prefix.count("`") % 2 == 0
+
+def _safe_split_index(text: str, max_len: int) -> int:
+    candidates = set()
+    for sep in ("\n\n", "\n", " "):
+        pos = text.rfind(sep, 0, max_len + 1)
+        while pos > 0:
+            candidates.add(pos + len(sep))
+            pos = text.rfind(sep, 0, pos)
+    candidates.add(max_len)
+
+    for idx in sorted(candidates, reverse=True):
+        if 0 < idx <= max_len and _markdown_cut_is_safe(text, idx):
+            return idx
+
+    logger.warning("Phai cat message tai %d ky tu; khong tim duoc diem markdown-safe", max_len)
+    return max_len
+
+def _split_long_block(block: str, max_len: int) -> List[str]:
+    chunks: List[str] = []
+    rest = block
+    while len(rest) > max_len:
+        cut = _safe_split_index(rest, max_len)
+        chunks.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    if rest:
+        chunks.append(rest)
+    return chunks
+
+def split_message(text: str, max_len: int = Config.MAX_PLAIN_TEXT) -> List[str]:
+    if max_len <= 0 or len(text) <= max_len:
         return [text]
 
     chunks: List[str] = []
     current = ""
-
     for block in text.split("\n\n"):
         candidate = block if not current else current + "\n\n" + block
         if len(candidate) <= max_len:
             current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        if len(block) > max_len:
+            chunks.extend(_split_long_block(block, max_len))
         else:
-            if current:
-                chunks.append(current)
-            if len(block) > max_len:
-                for i in range(0, len(block), max_len):
-                    chunks.append(block[i:i + max_len])
-                current = ""
-            else:
-                current = block
+            current = block
 
     if current:
         chunks.append(current)
-
     return chunks
 
 # =========================================================
-# SEND DIGEST
+# DISCORD RENDERER  (FIX H: safe_text)
+# Python render từ JSON — không để AI tự viết markdown Discord
 # =========================================================
 
-async def send_digest(channel: discord.abc.Messageable, start: datetime, end: datetime) -> None:
-    data = await build_all_digest(start, end)
+TAG_EMOJI: Dict[str, str] = {
+    "viral":      "🔥",
+    "ai":         "🤖",
+    "canh bao":   "⚠️",
+    "moi":        "🚀",
+    "game":       "🎮",
+    "tai chinh":  "💰",
+    "the gioi":   "🌏",
+    "viet nam":   "🇻🇳",
+    "suc khoe":   "🏥",
+    "phim":       "🎬",
+}
+
+def render_tag(tag: str) -> str:
+    emoji = TAG_EMOJI.get(tag.strip().lower(), "🏷️")
+    return f"{emoji} {safe_text(tag)}"
+
+def render_article(art: Dict[str, Any], rank: int) -> str:
+    title   = safe_text(art.get("title",   "Khong co tieu de"))
+    summary = safe_text(art.get("summary", ""))
+    url     = str(art.get("url", "")).strip()
+    source  = safe_text(art.get("source",  ""))
+    score   = art.get("final_score", 0)
+    tags    = art.get("tags", [])
+
+    medals  = {1: "🥇", 2: "🥈", 3: "🥉"}
+    medal   = medals.get(rank, f"#{rank}")
+
+    lines = [f"{medal} **{title}**"]
+    if tags:
+        lines.append("  ".join(render_tag(t) for t in tags))
+    if summary:
+        lines.append(summary)
+    meta = []
+    if source:
+        meta.append(f"📰 _{source}_")
+    if score:
+        meta.append(f"🎯 {int(score)}pt")
+    if meta:
+        lines.append("  •  ".join(meta))
+    if url:
+        lines.append(f"🔗 {url}")
+
+    return "\n".join(lines)
+
+
+async def send_ranked_digest(
+    channel: discord.abc.Messageable,
+    start: datetime,
+    end: datetime,
+) -> None:
+    judged       = await run_pipeline(start, end)
     total_topics = sum(len(v) for v in TOPIC_GROUPS.values())
+
+    if not judged:
+        await channel.send(
+            embed=discord.Embed(
+                title="📰 TECH DIGEST",
+                description=(
+                    f"🕐 **{format_range(start, end)}**\n"
+                    "⚠️ Khong tim thay tin moi trong khung thoi gian nay."
+                ),
+                color=0xAAAAAA,
+                timestamp=datetime.now(timezone.utc),
+            ),
+            allowed_mentions=NO_MENTIONS,
+        )
+        return
+
+    groups    = judged.get("groups", {})
+    highlight = safe_text(judged.get("highlight", ""))
+    n_groups  = len(groups)
+    n_arts    = sum(len(v) for v in groups.values() if isinstance(v, list))
 
     header = discord.Embed(
         title="📰 TECH DIGEST",
         description=(
             f"🕐 **{format_range(start, end)}**\n"
-            f"📂 **{len(data)}/{len(TOPIC_GROUPS)} nhóm**\n"
-            f"📌 **{total_topics} chủ đề**"
+            f"📂 **{n_groups} nhom**  •  📄 **{n_arts} tin chon loc**\n"
+            + (f"\n✨ _{highlight}_\n" if highlight else "")
+            + "━" * 26
         ),
         color=0x00FFCC,
-        timestamp=datetime.utcnow(),
+        timestamp=datetime.now(timezone.utc),
     )
-    await channel.send(embed=header)
+    header.set_footer(
+        text=f"🤖 Multi-Agent | {total_topics} topics | 6h | Anti-dup ON"
+    )
+    await channel.send(embed=header, allowed_mentions=NO_MENTIONS)
     await asyncio.sleep(0.8)
 
-    if not data:
-        await channel.send("⚠️ Không tìm thấy tin mới trong khung thời gian này.")
-        return
-
-    for item in data:
-        group = item["group"]
-        content = item["content"]
-        if not content:
+    for group_name, articles in groups.items():
+        if not isinstance(articles, list) or not articles:
             continue
 
         await channel.send(
             embed=discord.Embed(
-                title=group,
-                color=GROUP_COLORS.get(group, 0xAAAAAA),
-            )
+                title=safe_text(group_name),
+                color=GROUP_COLORS.get(group_name, 0xAAAAAA),
+            ),
+            allowed_mentions=NO_MENTIONS,
         )
 
-        for chunk in split_message(content):
-            await channel.send(chunk)
+        rendered  = [render_article(art, i + 1) for i, art in enumerate(articles)]
+        full_text = "\n\n".join(rendered)
+
+        for chunk in split_message(full_text):
+            await channel.send(chunk, allowed_mentions=NO_MENTIONS)
             await asyncio.sleep(Config.DISCORD_DELAY)
 
-    logger.info("✅ Đã gửi digest cho %s → %s", start, end)
+        await asyncio.sleep(0.5)
+
+    logger.info("Gui xong: %d nhom, %d tin | %s", n_groups, n_arts, format_range(start, end))
 
 # =========================================================
 # CHANNEL RESOLVE
@@ -571,91 +1168,192 @@ async def get_target_channel() -> Optional[discord.abc.Messageable]:
     try:
         return await bot.fetch_channel(CHANNEL_ID)
     except Exception as e:
-        logger.error("Không lấy được channel %s: %s", CHANNEL_ID, e)
+        logger.error("Khong lay duoc channel %s: %s", CHANNEL_ID, e)
         return None
 
 # =========================================================
-# SCHEDULER
+# SCHEDULER  (FIX A + B + catch-up + retry)
+# FIX B: chờ mốc tiếp theo TRƯỚC, không gửi ngay khi restart
 # =========================================================
 
+async def load_state_locked() -> None:
+    async with state_lock:
+        load_state()
+
+async def get_last_sent_key_locked() -> str:
+    async with state_lock:
+        load_state()
+        return last_sent_key
+
+async def get_last_processed_key_locked() -> str:
+    async with state_lock:
+        load_state()
+        return last_processed_key or last_sent_key
+
+async def mark_slot_sent(key: str) -> None:
+    global last_sent_key, last_processed_key
+    async with state_lock:
+        last_sent_key = key
+        last_processed_key = key
+        save_state()
+
+async def mark_slot_skipped(key: str) -> None:
+    global last_processed_key
+    async with state_lock:
+        if not last_processed_key or key > last_processed_key:
+            last_processed_key = key
+        save_state()
+
+async def process_due_slots(channel: discord.abc.Messageable) -> None:
+    while not bot.is_closed():
+        processed_key = await get_last_processed_key_locked()
+        due_slots = pending_slot_times(processed_key)
+        if not due_slots:
+            return
+
+        slot_time = due_slots[0]
+        key = slot_key(slot_time)
+        success = False
+        max_attempts = max(1, Config.SCHEDULER_SLOT_MAX_RETRIES)
+
+        for attempt in range(1, max_attempts + 1):
+            if bot.is_closed():
+                return
+
+            async with digest_lock:
+                latest_processed_key = await get_last_processed_key_locked()
+                if latest_processed_key and key <= latest_processed_key:
+                    success = True
+                    break
+
+                start = slot_time - timedelta(hours=Config.SEARCH_INTERVAL_HOURS)
+                logger.info(
+                    "Tu dong gui moc %s lan %d/%d | %s",
+                    key, attempt, max_attempts, format_range(start, slot_time),
+                )
+                try:
+                    await send_ranked_digest(channel, start, slot_time)
+                    await mark_slot_sent(key)
+                    success = True
+                    break
+                except Exception as e:
+                    logger.exception("Loi gui digest moc %s lan %d/%d: %s", key, attempt, max_attempts, e)
+
+            if attempt < max_attempts:
+                logger.warning("Retry moc %s sau %ss", key, Config.SCHEDULER_RETRY_DELAY)
+                await asyncio.sleep(Config.SCHEDULER_RETRY_DELAY)
+
+        if success:
+            continue
+
+        logger.error("Bo qua moc %s sau %d lan loi; chuyen sang moc tiep theo", key, max_attempts)
+        await mark_slot_skipped(key)
+
 async def auto_scheduler() -> None:
-    global last_sent_slot
-
     await bot.wait_until_ready()
-    channel = await get_target_channel()
-    if not channel:
-        return
-
-    load_state()
+    await load_state_locked()
 
     while not bot.is_closed():
-        slot = current_slot()
-        if slot != last_sent_slot:
-            now = vn_now()
-            start = now - timedelta(hours=Config.SEARCH_INTERVAL_HOURS)
-            logger.info("📢 Tự động gửi mốc %s:00", slot)
-            try:
-                await send_digest(channel, start, now)
-                last_sent_slot = slot
-                save_state()
-            except Exception as e:
-                logger.error("Lỗi gửi digest: %s", e)
+        try:
+            channel = await get_target_channel()
+            if not channel:
+                logger.error("Scheduler khong co channel; retry sau %ss", Config.BACKGROUND_TASK_RESTART_DELAY)
+                await asyncio.sleep(Config.BACKGROUND_TASK_RESTART_DELAY)
+                continue
+            await wait_until_next_slot()
+            await process_due_slots(channel)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Auto scheduler loop loi")
+            await asyncio.sleep(Config.BACKGROUND_TASK_RESTART_DELAY)
 
-        await wait_until_next_slot()
+async def supervised_background_task(name: str, coro_factory) -> None:
+    while not bot.is_closed():
+        try:
+            await coro_factory()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Background task %s chet; restart sau %ss",
+                name,
+                Config.BACKGROUND_TASK_RESTART_DELAY,
+            )
+        if not bot.is_closed():
+            await asyncio.sleep(Config.BACKGROUND_TASK_RESTART_DELAY)
 
 # =========================================================
 # COMMANDS
 # =========================================================
 
 @bot.command(name="news", aliases=["tin"])
-async def news(ctx: commands.Context):
+async def cmd_news(ctx: commands.Context):
     if ctx.channel.id != CHANNEL_ID:
-        await ctx.send(f"❌ Chỉ hoạt động trong kênh <#{CHANNEL_ID}>")
+        await ctx.send(f"Chi hoat dong trong kenh <#{CHANNEL_ID}>", allowed_mentions=NO_MENTIONS)
         return
-
     async with ctx.typing():
-        now = vn_now()
-        start = now - timedelta(hours=Config.SEARCH_INTERVAL_HOURS)
-        await send_digest(ctx.channel, start, now)
+        async with digest_lock:
+            now   = vn_now()
+            start = now - timedelta(hours=Config.SEARCH_INTERVAL_HOURS)
+            await send_ranked_digest(ctx.channel, start, now)
+
 
 @bot.command(name="ping")
-async def ping(ctx: commands.Context):
-    await ctx.send(f"🏓 Pong! `{round(bot.latency * 1000)}ms`")
+async def cmd_ping(ctx: commands.Context):
+    await ctx.send(f"Pong! `{round(bot.latency * 1000)}ms`", allowed_mentions=NO_MENTIONS)
+
 
 @bot.command(name="status")
-async def status(ctx: commands.Context):
-    vn = vn_now()
-    nxt = next_slot_time()
-    wait_minutes = int((nxt - vn).total_seconds() // 60)
+async def cmd_status(ctx: commands.Context):
+    vn   = vn_now()
+    nxt  = next_slot_time()
+    wait = int((nxt - vn).total_seconds() // 60)
 
-    embed = discord.Embed(
-        title="🤖 Bot Status",
-        color=0x00FF88,
-        timestamp=datetime.utcnow(),
-    )
-    embed.add_field(name="Giờ VN", value=vn.strftime("%H:%M:%S %d/%m/%Y"), inline=False)
-    embed.add_field(name="Mốc hiện tại", value=f"{current_slot()}:00", inline=True)
-    embed.add_field(name="Mốc tiếp theo", value=f"{nxt.strftime('%H:%M')} (~{wait_minutes}p)", inline=True)
-    embed.add_field(name="Đã gửi mốc", value=str(last_sent_slot), inline=True)
-    embed.add_field(name="Nhóm / Chủ đề", value=f"{len(TOPIC_GROUPS)} / {sum(len(v) for v in TOPIC_GROUPS.values())}", inline=True)
-    embed.add_field(name="Parallel", value=str(Config.MAX_PARALLEL_REQUESTS), inline=True)
-    embed.add_field(name="API Base", value=API_BASE or "Chưa đặt", inline=False)
-    await ctx.send(embed=embed)
+    embed = discord.Embed(title="Bot Status", color=0x00FF88, timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Gio VN",         value=vn.strftime("%H:%M:%S %d/%m/%Y"),             inline=False)
+    embed.add_field(name="Moc hien tai",   value=f"{current_slot()}:00",                       inline=True)
+    embed.add_field(name="Moc tiep theo",  value=f"{nxt.strftime('%H:%M')} (~{wait}p)",        inline=True)
+    saved_key = await get_last_sent_key_locked()
+    async with sent_urls_lock:
+        sent_count = len(load_sent_urls())
+    embed.add_field(name="Da gui moc",     value=saved_key or "Chua co",                       inline=True)  # FIX A
+    embed.add_field(name="Nhom/Chu de",    value=f"{len(TOPIC_GROUPS)} / {sum(len(v) for v in TOPIC_GROUPS.values())}", inline=True)
+    embed.add_field(name="URLs da nho",    value=f"{sent_count} bai",                          inline=True)
+    embed.add_field(name="Parallel",       value=str(Config.MAX_PARALLEL_RESEARCH),            inline=True)
+    embed.add_field(name="Researcher",     value=f"`{RESEARCH_MODEL}`",                        inline=True)
+    embed.add_field(name="Editor",         value=f"`{EDITOR_MODEL}`",                          inline=True)
+    embed.add_field(name="API Base",       value=RESEARCH_API_BASE or "Chua dat",              inline=False)
+    embed.add_field(name="Tavily",         value="ON" if TAVILY_ENABLED else "OFF",            inline=True)
+    await ctx.send(embed=embed, allowed_mentions=NO_MENTIONS)
+
 
 @bot.command(name="force", aliases=["forcenews"])
-async def force(ctx: commands.Context):
+async def cmd_force(ctx: commands.Context):
+    """Gửi ngay không chờ mốc — dùng để test."""
     if ctx.channel.id != CHANNEL_ID:
-        await ctx.send(f"❌ Chỉ hoạt động trong kênh <#{CHANNEL_ID}>")
+        await ctx.send(f"Chi hoat dong trong kenh <#{CHANNEL_ID}>", allowed_mentions=NO_MENTIONS)
         return
-
     async with ctx.typing():
-        now = vn_now()
-        start = now - timedelta(hours=Config.SEARCH_INTERVAL_HOURS)
-        await send_digest(ctx.channel, start, now)
+        async with digest_lock:
+            now   = vn_now()
+            start = now - timedelta(hours=Config.SEARCH_INTERVAL_HOURS)
+            await send_ranked_digest(ctx.channel, start, now)
+            await mark_slot_sent(slot_key(now))   # FIX A
 
-        global last_sent_slot
-        last_sent_slot = current_slot()
-        save_state()
+
+@bot.command(name="clearmem", aliases=["clear"])
+async def cmd_clearmem(ctx: commands.Context):
+    """Xóa memory anti-duplicate."""
+    if ctx.channel.id != CHANNEL_ID:
+        await ctx.send(f"Chi hoat dong trong kenh <#{CHANNEL_ID}>", allowed_mentions=NO_MENTIONS)
+        return
+    try:
+        async with sent_urls_lock:
+            save_sent_urls([])
+        await ctx.send("Da xoa memory anti-duplicate. Bot se tim lai tin tu dau.", allowed_mentions=NO_MENTIONS)
+    except Exception as e:
+        await ctx.send(f"Loi: {e}", allowed_mentions=NO_MENTIONS)
 
 # =========================================================
 # EVENTS
@@ -663,30 +1361,32 @@ async def force(ctx: commands.Context):
 
 @bot.event
 async def on_ready():
-    global scheduler_started
-
-    total_topics = sum(len(v) for v in TOPIC_GROUPS.values())
-    logger.info("✅ Bot online: %s | %s nhóm | %s chủ đề", bot.user, len(TOPIC_GROUPS), total_topics)
-
+    global scheduler_started, cache_cleanup_started
+    total = sum(len(v) for v in TOPIC_GROUPS.values())
+    logger.info("Bot online: %s | %s nhom | %s chu de", bot.user, len(TOPIC_GROUPS), total)
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name=f"{total_topics} chủ đề | mỗi 6h",
+            name=f"{total} topics | Multi-Agent | 6h",
         )
     )
-
     if not scheduler_started:
         scheduler_started = True
-        bot.loop.create_task(auto_scheduler())
+        asyncio.create_task(supervised_background_task("auto_scheduler", auto_scheduler))   # FIX K
         logger.info("Auto scheduler started")
+    if not cache_cleanup_started:
+        cache_cleanup_started = True
+        asyncio.create_task(supervised_background_task("cache_cleanup_loop", cache_cleanup_loop))
+        logger.info("Cache cleanup started")
+
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: Exception):
     if isinstance(error, commands.CommandNotFound):
-        await ctx.send("❓ Lệnh không tồn tại. Dùng `!news`, `!ping`, `!status`, `!force`")
+        await ctx.send("Lenh khong ton tai. Dung: `!news` `!ping` `!status` `!force` `!clearmem`", allowed_mentions=NO_MENTIONS)
     else:
         logger.error("Command error: %s", error)
-        await ctx.send(f"⚠️ Lỗi: {str(error)[:200]}")
+        await ctx.send(f"Loi: {str(error)[:200]}", allowed_mentions=NO_MENTIONS)
 
 # =========================================================
 # MAIN
@@ -694,13 +1394,19 @@ async def on_command_error(ctx: commands.Context, error: Exception):
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        raise SystemExit("Thiếu DISCORD_TOKEN trong .env")
+        raise SystemExit("Thieu DISCORD_TOKEN trong .env")
     if not CHANNEL_ID:
-        raise SystemExit("Thiếu CHANNEL_ID trong .env")
-    if not API_BASE:
-        raise SystemExit("Thiếu API_BASE trong .env")
-    if not API_KEY:
-        raise SystemExit("Thiếu API_KEY trong .env")
+        raise SystemExit("Thieu CHANNEL_ID trong .env")
+    if not TAVILY_ENABLED:
+        if not RESEARCH_API_BASE:
+            raise SystemExit("Thieu RESEARCH_API_BASE (hoac API_BASE) trong .env khi TAVILY_API_KEY chua dat")
+        if not RESEARCH_API_KEY:
+            raise SystemExit("Thieu RESEARCH_API_KEY (hoac API_KEY) trong .env khi TAVILY_API_KEY chua dat")
+    if not EDITOR_API_BASE:   # FIX J
+        raise SystemExit("Thieu EDITOR_API_BASE (hoac API_BASE) trong .env")
+    if not EDITOR_API_KEY:    # FIX J
+        raise SystemExit("Thieu EDITOR_API_KEY (hoac API_KEY) trong .env")
 
-    logger.info("Starting bot...")
+    logger.info("Tavily search: %s", "ON" if TAVILY_ENABLED else "OFF")
+    logger.info("Starting Multi-Agent News Bot...")
     bot.run(DISCORD_TOKEN)
