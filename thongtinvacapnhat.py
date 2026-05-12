@@ -192,11 +192,23 @@ TOPIC_GROUPS: Dict[str, List[str]] = {
         "music industry news",
         "Viet Nam phim giai tri",
     ],
-    "⛩️ Anime & Manga": [
-        "anime manga news 2026",
-        "One Piece Jujutsu Kaisen",
-        "anime adaptation light novel",
-        "Japanese anime industry",
+"⛩️ Seasonal Anime Episodes": [
+    "new anime episodes released today",
+    "seasonal anime airing schedule",
+    "currently airing anime latest episode",
+    "anime episode release calendar Japan",
+    "weekly anime broadcast schedule",
+    "anime simulcast updates Crunchyroll",
+    "anime simulcast updates Netflix",
+    "anime simulcast updates Bilibili",
+    "top seasonal anime this week",
+    "anime next episode release date",
+    "spring summer fall winter anime season",
+    "anime episode countdown",
+    "latest anime episode discussion",
+    "anime trending episodes today",
+    "new anime releases this week"
+],
     ],
     "🏥 Health": [
         "medical breakthrough virus",
