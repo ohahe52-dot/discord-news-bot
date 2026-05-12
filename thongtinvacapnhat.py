@@ -208,7 +208,6 @@ TOPIC_GROUPS: Dict[str, List[str]] = {
     "latest anime episode discussion",
     "anime trending episodes today",
     "new anime releases this week"
-],
     ],
     "🏥 Health": [
         "medical breakthrough virus",
