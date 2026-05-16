@@ -20,6 +20,7 @@ import asyncio
 import importlib
 import hashlib
 import html as html_lib
+import ipaddress
 import json
 import logging
 import os
@@ -120,9 +121,10 @@ class Config:
     TCP_ENABLE_CLEANUP_CLOSED = os.getenv("TCP_ENABLE_CLEANUP_CLOSED", "1").strip().lower() not in {"0", "false", "no", "off"}
     DNS_CACHE             = int(os.getenv("DNS_CACHE", "300") or 300)
 
-    RESEARCH_MAX_TOKENS   = int(os.getenv("RESEARCH_MAX_TOKENS", "1800") or 1800)
-    EDITOR_MAX_TOKENS     = int(os.getenv("EDITOR_MAX_TOKENS", "2000") or 2000)
+    RESEARCH_MAX_TOKENS   = int(os.getenv("RESEARCH_MAX_TOKENS", "2200") or 2200)
+    EDITOR_MAX_TOKENS     = int(os.getenv("EDITOR_MAX_TOKENS", "3200") or 3200)
     RESEARCH_TOOL_MAX_STEPS = int(os.getenv("RESEARCH_TOOL_MAX_STEPS", "4") or 4)
+    RESEARCH_MIN_OBSERVED_ARTICLES = int(os.getenv("RESEARCH_MIN_OBSERVED_ARTICLES", "8") or 8)
 
     STATE_FILE            = "bot_state.json"
     SENT_URLS_FILE        = "sent_urls.json"
@@ -136,10 +138,10 @@ class Config:
     TAVILY_MAX_RESULTS    = int(os.getenv("TAVILY_MAX_RESULTS", "4") or 4)
     TAVILY_SEARCH_DEPTH   = os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip() or "basic"
 
-    WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "15") or 15)
+    WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "20") or 20)
     WEB_SEARCH_TYPE       = os.getenv("WEB_SEARCH_TYPE", "web").strip() or "web"
 
-    SEARXNG_MAX_RESULTS   = int(os.getenv("SEARXNG_MAX_RESULTS", "5") or 5)
+    SEARXNG_MAX_RESULTS   = int(os.getenv("SEARXNG_MAX_RESULTS", "8") or 8)
     SEARXNG_CATEGORIES    = os.getenv("SEARXNG_CATEGORIES", "news,general").strip() or "news,general"
     SEARXNG_LANGUAGE      = os.getenv("SEARXNG_LANGUAGE", "all").strip() or "all"
     SEARXNG_TIME_RANGE    = os.getenv("SEARXNG_TIME_RANGE", "day").strip() or "day"
@@ -156,6 +158,17 @@ class Config:
     SEARXNG_MAX_DELAY     = float(os.getenv("SEARXNG_MAX_DELAY", "2.5") or 2.5)
     HTML_PARSE_MAX_BYTES  = int(os.getenv("HTML_PARSE_MAX_BYTES", "800000") or 800000)
     LOG_COOLDOWN_SECONDS  = float(os.getenv("LOG_COOLDOWN_SECONDS", "60") or 60)
+
+    ARTICLE_FETCH_ENABLED = os.getenv("ARTICLE_FETCH_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+    ARTICLE_FETCH_MAX_ARTICLES = int(os.getenv("ARTICLE_FETCH_MAX_ARTICLES", "48") or 48)
+    ARTICLE_FETCH_CONCURRENCY = int(os.getenv("ARTICLE_FETCH_CONCURRENCY", "12") or 12)
+    ARTICLE_FETCH_TIMEOUT = float(os.getenv("ARTICLE_FETCH_TIMEOUT", "18") or 18)
+    ARTICLE_FETCH_MAX_BYTES = int(os.getenv("ARTICLE_FETCH_MAX_BYTES", "1200000") or 1200000)
+    ARTICLE_FETCH_MAX_CHARS = int(os.getenv("ARTICLE_FETCH_MAX_CHARS", "9000") or 9000)
+    ARTICLE_FETCH_MIN_TEXT_CHARS = int(os.getenv("ARTICLE_FETCH_MIN_TEXT_CHARS", "450") or 450)
+    ARTICLE_EDITOR_TEXT_CHARS = int(os.getenv("ARTICLE_EDITOR_TEXT_CHARS", "2800") or 2800)
+    ARTICLE_KEY_POINTS = int(os.getenv("ARTICLE_KEY_POINTS", "6") or 6)
+    EDITOR_ARTICLES_PER_GROUP = int(os.getenv("EDITOR_ARTICLES_PER_GROUP", "14") or 14)
 
     # Tracking params cần loại bỏ khi normalize URL
     TRACKING_PARAMS = {
@@ -262,6 +275,7 @@ VN_TZ = timezone(timedelta(hours=Config.TIMEZONE_OFFSET))
 research_semaphore = asyncio.Semaphore(Config.MAX_PARALLEL_RESEARCH)
 editor_semaphore   = asyncio.Semaphore(Config.MAX_PARALLEL_EDITOR)
 searxng_semaphore  = asyncio.Semaphore(Config.MAX_PARALLEL_SEARXNG)
+article_fetch_semaphore = asyncio.Semaphore(Config.ARTICLE_FETCH_CONCURRENCY)
 state_lock         = asyncio.Lock()
 sent_urls_lock     = asyncio.Lock()
 digest_lock        = asyncio.Lock()
@@ -1511,6 +1525,238 @@ def merge_unique_articles(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return merged
 
 
+# =========================================================
+# ARTICLE FETCH / WEB DATA ENRICHMENT
+# =========================================================
+
+SKIP_FETCH_EXTENSIONS = {
+    ".7z", ".avi", ".css", ".csv", ".doc", ".docx", ".gif", ".gz",
+    ".jpeg", ".jpg", ".js", ".json", ".m4a", ".mkv", ".mov", ".mp3",
+    ".mp4", ".pdf", ".png", ".ppt", ".pptx", ".rar", ".svg", ".webm",
+    ".webp", ".xls", ".xlsx", ".zip",
+}
+
+def is_fetchable_article_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        host = (parsed.hostname or "").strip().lower()
+        if not host or host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+            return False
+        try:
+            ip = ipaddress.ip_address(host.strip("[]"))
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return False
+        except ValueError:
+            pass
+        path = parsed.path.lower()
+        return not any(path.endswith(ext) for ext in SKIP_FETCH_EXTENSIONS)
+    except Exception:
+        return False
+
+async def read_limited_response(resp: aiohttp.ClientResponse, max_bytes: int) -> bytes:
+    chunks: List[bytes] = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(65536):
+        total += len(chunk)
+        if total > max_bytes:
+            remain = max_bytes - (total - len(chunk))
+            if remain > 0:
+                chunks.append(chunk[:remain])
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+def extract_html_title(html: str) -> str:
+    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", html)
+    if not m:
+        return ""
+    return strip_html_fragment(m.group(1))[:220]
+
+def extract_article_text(html: str) -> str:
+    html = re.sub(r"(?is)<(script|style|noscript|svg|canvas|iframe|form|nav|footer|header)\b.*?</\1>", " ", html)
+    candidates: List[str] = []
+    for tag in ("article", "main"):
+        candidates.extend(re.findall(fr"(?is)<{tag}\b[^>]*>(.*?)</{tag}>", html))
+    if not candidates:
+        body = re.search(r"(?is)<body\b[^>]*>(.*?)</body>", html)
+        candidates = [body.group(1) if body else html]
+
+    best = max(candidates, key=lambda x: len(strip_html_fragment(x)), default=html)
+    best = re.sub(r"(?is)</?(p|br|li|h[1-6]|blockquote|section|div)\b[^>]*>", "\n", best)
+    text = strip_html_fragment(best)
+
+    bad_fragments = (
+        "cookie", "subscribe", "newsletter", "advertisement", "quang cao",
+        "dang nhap", "login", "share this", "all rights reserved",
+    )
+    lines = []
+    for line in re.split(r"[\r\n]+", text):
+        line = re.sub(r"\s+", " ", line).strip()
+        if len(line) < 35:
+            continue
+        lower = line.lower()
+        if any(fragment in lower for fragment in bad_fragments):
+            continue
+        lines.append(line)
+
+    return "\n".join(lines).strip()
+
+def sentence_list(text: str) -> List[str]:
+    pieces = re.split(r"(?<=[.!?。！？])\s+|[\r\n]+", text)
+    sentences = []
+    for piece in pieces:
+        clean = re.sub(r"\s+", " ", piece).strip()
+        if 55 <= len(clean) <= 320:
+            sentences.append(clean)
+    return sentences
+
+def build_key_points(text: str, title: str = "", limit: Optional[int] = None) -> List[str]:
+    limit = limit or Config.ARTICLE_KEY_POINTS
+    sentences = sentence_list(text)
+    if not sentences:
+        return []
+
+    title_terms = {
+        w.lower()
+        for w in re.findall(r"[\wÀ-ỹ]+", title)
+        if len(w) >= 4
+    }
+
+    scored = []
+    for idx, sent in enumerate(sentences[:80]):
+        words = {w.lower() for w in re.findall(r"[\wÀ-ỹ]+", sent) if len(w) >= 4}
+        overlap = len(words & title_terms)
+        score = overlap * 4 + max(0, 10 - idx)
+        if any(k in sent.lower() for k in ("du kien", "dự kiến", "cho biet", "cho biết", "theo", "nghien cuu", "nghiên cứu", "cong bo", "công bố", "quy dinh", "quy định", "anh huong", "ảnh hưởng")):
+            score += 3
+        scored.append((score, idx, sent))
+
+    selected = []
+    seen = set()
+    for _, _, sent in sorted(scored, reverse=True):
+        key = re.sub(r"\W+", "", sent.lower())[:120]
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(sent)
+        if len(selected) >= limit:
+            break
+
+    selected.sort(key=lambda s: sentences.index(s) if s in sentences else 999)
+    return selected
+
+async def fetch_article_detail(
+    session: aiohttp.ClientSession,
+    article: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not Config.ARTICLE_FETCH_ENABLED:
+        return article
+
+    url = str(article.get("url", "")).strip()
+    if not is_fetchable_article_url(url):
+        article["fetch_status"] = "skipped"
+        return article
+
+    headers = {
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "vi,en-US;q=0.9,en;q=0.8",
+        "User-Agent": Config.SEARXNG_USER_AGENT,
+    }
+
+    async with article_fetch_semaphore:
+        try:
+            async with session.get(
+                url,
+                headers=headers,
+                allow_redirects=True,
+                timeout=search_timeout(Config.ARTICLE_FETCH_TIMEOUT),
+            ) as resp:
+                if resp.status >= 400:
+                    article["fetch_status"] = f"http_{resp.status}"
+                    return article
+                ctype = resp.headers.get("Content-Type", "").lower()
+                if "text/html" not in ctype and "application/xhtml" not in ctype and not ctype.startswith("text/"):
+                    article["fetch_status"] = "non_html"
+                    return article
+                raw = await read_limited_response(resp, Config.ARTICLE_FETCH_MAX_BYTES)
+
+            html = raw.decode("utf-8", errors="ignore")
+            text = extract_article_text(html)
+            if len(text) < Config.ARTICLE_FETCH_MIN_TEXT_CHARS:
+                article["fetch_status"] = "too_short"
+                return article
+
+            article["fetched_title"] = extract_html_title(html)
+            article["full_text"] = text[:Config.ARTICLE_FETCH_MAX_CHARS]
+            article["key_points"] = build_key_points(text, str(article.get("title", "")))
+            article["content_chars"] = len(text)
+            article["fetch_status"] = "ok"
+            return article
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            article["fetch_status"] = f"error:{type(e).__name__}"
+            logger.debug("Fetch article failed %s: %s", url, str(e)[:180])
+            return article
+
+async def enrich_articles_for_editor(
+    session: aiohttp.ClientSession,
+    articles: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not Config.ARTICLE_FETCH_ENABLED or not articles:
+        return articles
+
+    targets = articles[:Config.ARTICLE_FETCH_MAX_ARTICLES]
+    rest = articles[Config.ARTICLE_FETCH_MAX_ARTICLES:]
+    tasks = [fetch_article_detail(session, dict(art)) for art in targets]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    enriched: List[Dict[str, Any]] = []
+    for original, result in zip(targets, results):
+        if isinstance(result, dict):
+            enriched.append(result)
+        else:
+            logger.debug("Article fetch task failed: %s", result)
+            enriched.append(original)
+
+    ok_count = sum(1 for art in enriched if art.get("fetch_status") == "ok")
+    logger.info("Article fetch enrich: %d/%d ok", ok_count, len(targets))
+    return enriched + rest
+
+def prepare_articles_for_editor(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    prepared: List[Dict[str, Any]] = []
+    ranked = sorted(
+        articles,
+        key=lambda art: importance_from_score(art.get("importance", 50)),
+        reverse=True,
+    )
+    for art in ranked[:Config.EDITOR_ARTICLES_PER_GROUP]:
+        item = {
+            "title": str(art.get("title", ""))[:260],
+            "summary": str(art.get("summary", ""))[:900],
+            "url": str(art.get("url", "")),
+            "source": str(art.get("source", "")),
+            "topic": str(art.get("topic", "")),
+            "_group": str(art.get("_group", "")),
+            "importance": importance_from_score(art.get("importance", 50)),
+            "published_at": str(art.get("published_at", "")),
+            "search_query": str(art.get("search_query", ""))[:220],
+            "fetch_status": str(art.get("fetch_status", "")),
+            "content_chars": int(art.get("content_chars", 0) or 0),
+        }
+        key_points = art.get("key_points")
+        if isinstance(key_points, list) and key_points:
+            item["key_points"] = [str(x)[:320] for x in key_points[:Config.ARTICLE_KEY_POINTS]]
+        full_text = str(art.get("full_text", "")).strip()
+        if full_text:
+            item["full_text"] = full_text[:Config.ARTICLE_EDITOR_TEXT_CHARS]
+        prepared.append(item)
+    return prepared
+
+
 async def search_topic_backends(
     session: aiohttp.ClientSession,
     topic: str,
@@ -1556,6 +1802,7 @@ Kien truc bat buoc:
 - Chi lay tin nam trong rolling 12-hour window nguoi dung cung cap.
 - Khong bia dat URL. Chi dung URL da xuat hien trong observation cua tool.
 - Neu chua co observation hoac ket qua yeu, hay goi tool search truoc khi final.
+- Neu result_count it hoac ket qua qua chung chung, phai search query khac cu the hon truoc khi final.
 
 Tool co san:
 - searxng_search(query): tim web/news qua SearXNG.
@@ -1575,7 +1822,7 @@ De ket thuc:
   "articles": [
     {
       "title": "Tieu de tin bang tieng Viet",
-      "summary": "Tom tat 2 cau ngan gon bang tieng Viet, neu ro y nghia tin.",
+      "summary": "Tom tat 2-3 cau ngan bang tieng Viet, neu ro y nghia tin va tac dong chinh.",
       "url": "https://...",
       "source": "Ten nguon",
       "topic": "Chu de goc",
@@ -1591,6 +1838,7 @@ Quy tac final:
 - Chon 0-4 bai moi, noi bat, lien quan nhat.
 - Deduplicate theo URL va noi dung.
 - Uu tien nguon goc/bao lon/nguon chinh thuc.
+- Neu da co nhieu observation tot, hay chon tin dua tren bang chung trong observation, khong chi dua vao tieu de.
 - importance tu 0 den 100.
 - Neu khong co tin phu hop khung gio: {"action":"final","articles":[]}."""
 
@@ -1613,15 +1861,16 @@ def parse_research_action(raw: str) -> Optional[Dict[str, Any]]:
 def compact_tool_observations(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Rut gon output tool de dua lai cho Agent 1, tranh phinh context."""
     compact: List[Dict[str, Any]] = []
-    for art in articles[:Config.SEARXNG_MAX_RESULTS]:
+    for art in articles[:max(Config.SEARXNG_MAX_RESULTS, Config.RESEARCH_MIN_OBSERVED_ARTICLES)]:
         compact.append(
             {
                 "title": str(art.get("title", ""))[:220],
-                "summary": str(art.get("summary", ""))[:500],
+                "summary": str(art.get("summary", ""))[:700],
                 "url": str(art.get("url", "")),
                 "source": str(art.get("source", "")),
                 "published_at": str(art.get("published_at", "")),
                 "search_query": str(art.get("search_query", ""))[:220],
+                "importance": importance_from_score(art.get("importance", 50)),
             }
         )
     return compact
@@ -1792,6 +2041,21 @@ async def research_topic(
                 continue
 
             if action_name == "final":
+                if (
+                    len(observed_articles) < Config.RESEARCH_MIN_OBSERVED_ARTICLES
+                    and len(searched_queries) < Config.RESEARCH_TOOL_MAX_STEPS
+                    and step < Config.RESEARCH_TOOL_MAX_STEPS - 1
+                ):
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Moi co {len(observed_articles)} ket qua quan sat, chua du rong. "
+                                "Hay search them 1 query khac cu the hon, uu tien nguon goc/bao lon/nguon chinh thuc."
+                            ),
+                        }
+                    )
+                    continue
                 valid = validate_research_package(action.get("articles"), group, topic, observed_articles)
                 if valid:
                     set_cache(cache_key, json.dumps(valid, ensure_ascii=False))
@@ -1843,12 +2107,14 @@ EDITOR_SYSTEM = """Ban la Tong bien tap tin tuc AI.
 
 Nhiem vu:
 - Doc danh sach bai bao tho tu nhieu chu de (truong _group cho biet nhom)
+- Uu tien doc key_points va full_text neu co; chi fallback sang summary khi fetch_status khong ok.
 - Danh gia tung bai theo 4 tieu chi: viral(0-100), impact(0-100), interesting(0-100), trustworthy(0-100)
 - Tinh final_score = (viral*0.3 + impact*0.3 + interesting*0.25 + trustworthy*0.15)
 - Loai bo: tin trung noi dung, clickbait, spam, quang cao, tin co final_score < 40
 - Chon top 3 tin tot nhat moi nhom (dua theo truong _group)
 - GIU NGUYEN url, title tu input (tuyet doi khong bia dat URL)
-- summary co the viet lai ngan gon hon bang tieng Viet
+- summary phai tom tat y chinh nhieu hon: 3-5 y ngan bang tieng Viet, co tac dong/vi sao dang chu y.
+- Khong dua thong tin khong co trong input. Neu full_text mau thuan summary, tin vao full_text/key_points hon.
 
 Output CHI la JSON object, tuyet doi khong co text thua ben ngoai:
 {
@@ -1856,7 +2122,7 @@ Output CHI la JSON object, tuyet doi khong co text thua ben ngoai:
     "Ten nhom": [
       {
         "title": "...",
-        "summary": "Tom tat 2-3 cau tieng Viet.",
+        "summary": "3-5 y chinh ngan gon bang tieng Viet, uu tien thong tin tu key_points/full_text.",
         "url": "https://...",
         "source": "...",
         "final_score": 87,
@@ -1891,6 +2157,7 @@ async def judge_article_group(
     """Agent 2: judge riêng 1 nhóm tin, dùng cho đa request/response."""
     if not articles:
         return None
+    editor_articles = prepare_articles_for_editor(articles)
 
     async with editor_semaphore:
         result = await _api_call(
@@ -1904,10 +2171,11 @@ async def judge_article_group(
                     "role": "user",
                     "content": (
                         f"Chi danh gia nhom: {group_name}\n"
-                        f"Co {len(articles)} bai bao tho duoi day.\n"
+                        f"Co {len(editor_articles)} bai bao da search/fetch duoi day.\n"
                         "Hay danh gia, loc va tra ve JSON chuan. "
+                        "Hay doc key_points/full_text truoc khi viet summary; tom tat nhieu y chinh hon, khong chi viet lai snippet. "
                         "Truong groups chi gom dung nhom nay:\n\n"
-                        + json.dumps(articles, ensure_ascii=False)
+                        + json.dumps(editor_articles, ensure_ascii=False)
                     ),
                 },
             ],
@@ -2028,6 +2296,7 @@ async def run_pipeline(start: datetime, end: datetime) -> Optional[Dict[str, Any
 
         connector = aiohttp.TCPConnector(limit=20)  # FIX I
         async with aiohttp.ClientSession(connector=connector) as session:
+            new_articles = await enrich_articles_for_editor(session, new_articles)
             judged = await judge_news(session, new_articles)
 
         if judged:
@@ -2408,6 +2677,16 @@ async def cmd_status(ctx: commands.Context):
     embed.add_field(name="Agent 1 Flow",   value="Tool-using researcher -> Web Search",        inline=False)
     embed.add_field(name="Web Search",     value="ON" if WEB_SEARCH_ENABLED else "OFF",        inline=True)
     embed.add_field(name="SearXNG Fallback", value="ON" if SEARXNG_ENABLED else "OFF",         inline=True)
+    embed.add_field(
+        name="Article Fetch",
+        value=(
+            f"ON | max {Config.ARTICLE_FETCH_MAX_ARTICLES} | "
+            f"{Config.ARTICLE_FETCH_CONCURRENCY} song song"
+            if Config.ARTICLE_FETCH_ENABLED
+            else "OFF"
+        ),
+        inline=False,
+    )
     embed.add_field(name="Tavily",         value="Legacy" if TAVILY_ENABLED else "OFF",        inline=True)
     await ctx.send(embed=embed, allowed_mentions=NO_MENTIONS)
 
