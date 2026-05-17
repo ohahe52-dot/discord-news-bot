@@ -95,17 +95,17 @@ class Config:
     API_RETRY_JITTER      = float(os.getenv("API_RETRY_JITTER", "1.5") or 1.5)
     RETRY_MAX_DELAY       = float(os.getenv("RETRY_MAX_DELAY", "45") or 45)
     RETRY_STORM_JITTER    = float(os.getenv("RETRY_STORM_JITTER", "2.5") or 2.5)
-    REQUEST_TIMEOUT       = float(os.getenv("REQUEST_TIMEOUT", "180") or 180)
+    REQUEST_TIMEOUT       = float(os.getenv("REQUEST_TIMEOUT", "600") or 600)
 
     API_CONNECT_TIMEOUT   = float(os.getenv("API_CONNECT_TIMEOUT", "15") or 15)
-    API_SOCK_READ_TIMEOUT = float(os.getenv("API_SOCK_READ_TIMEOUT", "180") or 180)
-    SEARCH_TOTAL_TIMEOUT  = float(os.getenv("SEARCH_TOTAL_TIMEOUT", "35") or 35)
+    API_SOCK_READ_TIMEOUT = float(os.getenv("API_SOCK_READ_TIMEOUT", "600") or 600)
+    SEARCH_TOTAL_TIMEOUT  = float(os.getenv("SEARCH_TOTAL_TIMEOUT", "600") or 600)
     SEARCH_CONNECT_TIMEOUT = float(os.getenv("SEARCH_CONNECT_TIMEOUT", "8") or 8)
-    SEARCH_SOCK_READ_TIMEOUT = float(os.getenv("SEARCH_SOCK_READ_TIMEOUT", "25") or 25)
+    SEARCH_SOCK_READ_TIMEOUT = float(os.getenv("SEARCH_SOCK_READ_TIMEOUT", "600") or 600)
 
-    MAX_PARALLEL_RESEARCH = int(os.getenv("MAX_PARALLEL_RESEARCH", "50"))
-    MAX_PARALLEL_EDITOR   = int(os.getenv("MAX_PARALLEL_EDITOR", "50"))
-    MAX_PARALLEL_SEARXNG  = int(os.getenv("MAX_PARALLEL_SEARXNG", "50"))
+    MAX_PARALLEL_RESEARCH = int(os.getenv("MAX_PARALLEL_RESEARCH", "12"))
+    MAX_PARALLEL_EDITOR   = int(os.getenv("MAX_PARALLEL_EDITOR", "6"))
+    MAX_PARALLEL_SEARXNG  = int(os.getenv("MAX_PARALLEL_SEARXNG", "6"))
     RESEARCH_QUEUE_MAX    = int(os.getenv("RESEARCH_QUEUE_MAX", "24"))
     MAX_PLAIN_TEXT        = 1900
     DISCORD_DELAY         = 0.4
@@ -115,8 +115,8 @@ class Config:
     CACHE_CLEANUP_INTERVAL = 3600
     SEARCH_QUERY_CACHE_EXPIRE = int(os.getenv("SEARCH_QUERY_CACHE_EXPIRE", "600") or 600)
 
-    TCP_LIMIT             = int(os.getenv("TCP_LIMIT", "80") or 80)
-    TCP_LIMIT_PER_HOST    = int(os.getenv("TCP_LIMIT_PER_HOST", "12") or 12)
+    TCP_LIMIT             = int(os.getenv("TCP_LIMIT", "30") or 30)
+    TCP_LIMIT_PER_HOST    = int(os.getenv("TCP_LIMIT_PER_HOST", "4") or 4)
     TCP_KEEPALIVE         = float(os.getenv("TCP_KEEPALIVE", "45") or 45)
     TCP_ENABLE_CLEANUP_CLOSED = os.getenv("TCP_ENABLE_CLEANUP_CLOSED", "1").strip().lower() not in {"0", "false", "no", "off"}
     DNS_CACHE             = int(os.getenv("DNS_CACHE", "300") or 300)
@@ -154,15 +154,17 @@ class Config:
     SEARXNG_JSON_COOLDOWN = float(os.getenv("SEARXNG_JSON_COOLDOWN", "300") or 300)
     SEARXNG_HEALTH_INTERVAL = float(os.getenv("SEARXNG_HEALTH_INTERVAL", "60") or 60)
     SEARXNG_HEALTH_TIMEOUT = float(os.getenv("SEARXNG_HEALTH_TIMEOUT", "8") or 8)
-    SEARXNG_MIN_DELAY     = float(os.getenv("SEARXNG_MIN_DELAY", "0.15") or 0.15)
-    SEARXNG_MAX_DELAY     = float(os.getenv("SEARXNG_MAX_DELAY", "2.5") or 2.5)
+    SEARXNG_MIN_DELAY     = float(os.getenv("SEARXNG_MIN_DELAY", "0.05") or 0.05)
+    SEARXNG_MAX_DELAY     = float(os.getenv("SEARXNG_MAX_DELAY", "0.10") or 0.10)
+    REQUEST_PACE_MIN_DELAY = float(os.getenv("REQUEST_PACE_MIN_DELAY", "0.05") or 0.05)
+    REQUEST_PACE_MAX_DELAY = float(os.getenv("REQUEST_PACE_MAX_DELAY", "0.10") or 0.10)
     HTML_PARSE_MAX_BYTES  = int(os.getenv("HTML_PARSE_MAX_BYTES", "800000") or 800000)
     LOG_COOLDOWN_SECONDS  = float(os.getenv("LOG_COOLDOWN_SECONDS", "60") or 60)
 
     ARTICLE_FETCH_ENABLED = os.getenv("ARTICLE_FETCH_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
     ARTICLE_FETCH_MAX_ARTICLES = int(os.getenv("ARTICLE_FETCH_MAX_ARTICLES", "48") or 48)
-    ARTICLE_FETCH_CONCURRENCY = int(os.getenv("ARTICLE_FETCH_CONCURRENCY", "12") or 12)
-    ARTICLE_FETCH_TIMEOUT = float(os.getenv("ARTICLE_FETCH_TIMEOUT", "18") or 18)
+    ARTICLE_FETCH_CONCURRENCY = int(os.getenv("ARTICLE_FETCH_CONCURRENCY", "6") or 6)
+    ARTICLE_FETCH_TIMEOUT = float(os.getenv("ARTICLE_FETCH_TIMEOUT", "600") or 600)
     ARTICLE_FETCH_MAX_BYTES = int(os.getenv("ARTICLE_FETCH_MAX_BYTES", "1200000") or 1200000)
     ARTICLE_FETCH_MAX_CHARS = int(os.getenv("ARTICLE_FETCH_MAX_CHARS", "9000") or 9000)
     ARTICLE_FETCH_MIN_TEXT_CHARS = int(os.getenv("ARTICLE_FETCH_MIN_TEXT_CHARS", "450") or 450)
@@ -276,6 +278,8 @@ research_semaphore = asyncio.Semaphore(Config.MAX_PARALLEL_RESEARCH)
 editor_semaphore   = asyncio.Semaphore(Config.MAX_PARALLEL_EDITOR)
 searxng_semaphore  = asyncio.Semaphore(Config.MAX_PARALLEL_SEARXNG)
 article_fetch_semaphore = asyncio.Semaphore(Config.ARTICLE_FETCH_CONCURRENCY)
+request_pace_lock = asyncio.Lock()
+last_request_started_at = 0.0
 state_lock         = asyncio.Lock()
 sent_urls_lock     = asyncio.Lock()
 digest_lock        = asyncio.Lock()
@@ -432,6 +436,21 @@ def make_tcp_connector(limit: Optional[int] = None, per_host: Optional[int] = No
         enable_cleanup_closed=Config.TCP_ENABLE_CLEANUP_CLOSED,
     )
 
+
+async def pace_http_request(label: str = "") -> None:
+    """Global request pacing: start every HTTP request 50-100ms apart."""
+    global last_request_started_at
+
+    min_delay = max(0.0, Config.REQUEST_PACE_MIN_DELAY)
+    max_delay = max(min_delay, Config.REQUEST_PACE_MAX_DELAY)
+
+    async with request_pace_lock:
+        now = time.perf_counter()
+        target_gap = random.uniform(min_delay, max_delay)
+        wait_for = (last_request_started_at + target_gap) - now
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        last_request_started_at = time.perf_counter()
 
 def search_cache_key(kind: str, query: str, start: datetime, end: datetime) -> str:
     raw = f"{kind}:{query.strip().lower()}:{start.isoformat()}:{end.isoformat()}"
@@ -829,6 +848,7 @@ async def _api_call(
     for attempt in range(Config.MAX_RETRIES + 1):
         try:
             started = time.perf_counter()
+            await pace_http_request("api")
             async with session.post(
                 f"{api_base}/chat/completions",
                 headers={
@@ -970,6 +990,7 @@ async def tavily_search_topic(
     data: Optional[Dict[str, Any]] = None
     for attempt in range(Config.MAX_RETRIES + 1):
         try:
+            await pace_http_request("tavily")
             async with session.post(
                 f"{TAVILY_API_BASE}/search",
                 headers=headers,
@@ -1133,6 +1154,7 @@ async def compatible_web_search_query(
     for attempt in range(Config.MAX_RETRIES + 1):
         try:
             started = time.perf_counter()
+            await pace_http_request("web_search")
             async with session.post(
                 web_search_url(),
                 headers=headers,
@@ -1382,6 +1404,7 @@ async def searxng_search_html(
 
     for attempt in range(Config.MAX_RETRIES + 1):
         try:
+            await pace_http_request("searxng_html")
             async with session.get(
                 f"{SEARXNG_BASE_URL}/search",
                 params=params,
@@ -1431,7 +1454,7 @@ async def searxng_search_query(
         return []
 
     async with searxng_semaphore:
-        await asyncio.sleep(random.uniform(0.15, 0.8))
+        await asyncio.sleep(random.uniform(Config.SEARXNG_MIN_DELAY, Config.SEARXNG_MAX_DELAY))
 
         web_articles = await compatible_web_search_query(session, clean_query, group, topic, start, end)
         if isinstance(web_articles, list):
@@ -1454,6 +1477,7 @@ async def searxng_search_query(
         data: Optional[Dict[str, Any]] = None
         for attempt in range(Config.MAX_RETRIES + 1):
             try:
+                await pace_http_request("searxng_json")
                 async with session.get(
                     f"{SEARXNG_BASE_URL}/search",
                     params=params,
@@ -1667,6 +1691,7 @@ async def fetch_article_detail(
 
     async with article_fetch_semaphore:
         try:
+            await pace_http_request("article_fetch")
             async with session.get(
                 url,
                 headers=headers,
@@ -2257,10 +2282,7 @@ async def judge_news(
 
 async def collect_news(start: datetime, end: datetime) -> List[Dict[str, Any]]:
     """Agent 1: chạy song song tất cả topics."""
-    connector = aiohttp.TCPConnector(   # FIX I: bỏ ssl=False
-        limit=Config.TCP_LIMIT,
-        ttl_dns_cache=Config.DNS_CACHE,
-    )
+    connector = make_tcp_connector()
     async with aiohttp.ClientSession(connector=connector) as session:
         flat    = [(g, t) for g, topics in TOPIC_GROUPS.items() for t in topics]
         tasks   = [research_topic(session, t, g, start, end) for g, t in flat]
@@ -2294,7 +2316,7 @@ async def run_pipeline(start: datetime, end: datetime) -> Optional[Dict[str, Any
             logger.info("Tat ca tin da duoc gui truoc do.")
             return None
 
-        connector = aiohttp.TCPConnector(limit=20)  # FIX I
+        connector = make_tcp_connector()
         async with aiohttp.ClientSession(connector=connector) as session:
             new_articles = await enrich_articles_for_editor(session, new_articles)
             judged = await judge_news(session, new_articles)
@@ -2671,6 +2693,12 @@ async def cmd_status(ctx: commands.Context):
     embed.add_field(name="URLs da nho",    value=f"{sent_count} bai",                          inline=True)
     embed.add_field(name="Research Parallel", value=str(Config.MAX_PARALLEL_RESEARCH),         inline=True)
     embed.add_field(name="Editor Parallel",   value=str(Config.MAX_PARALLEL_EDITOR),           inline=True)
+    embed.add_field(
+        name="Request Pace",
+        value=f"{int(Config.REQUEST_PACE_MIN_DELAY * 1000)}-{int(Config.REQUEST_PACE_MAX_DELAY * 1000)}ms/request",
+        inline=True,
+    )
+    embed.add_field(name="Timeout", value=f"{int(Config.REQUEST_TIMEOUT // 60)} phut", inline=True)
     embed.add_field(name="Researcher",     value=f"`{RESEARCH_MODEL}`",                        inline=True)
     embed.add_field(name="Editor",         value=f"`{EDITOR_MODEL}`",                          inline=True)
     embed.add_field(name="Research API",   value=RESEARCH_API_BASE or "Chua dat",              inline=False)
